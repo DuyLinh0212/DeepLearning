@@ -1,0 +1,9 @@
+# Go nhe cho Colab (torch/torchvision da co san tren Colab)
+numpy
+pandas
+scikit-learn
+scipy
+nibabel
+Pillow
+tqdm
+tensorboard
