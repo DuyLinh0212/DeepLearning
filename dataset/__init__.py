@@ -1,1 +1,1 @@
-from .dataset import MRDataset, load_data
+from .dataset import MRData, load_data
