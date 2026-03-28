@@ -4,159 +4,112 @@ import numpy as np
 
 import torch
 import torch.utils.data as data
+from torchvision import transforms
 
-from preprocessing.intensity_clipping import percentile_clipping
-from preprocessing.z_score_normalization import z_score_normalize
-from preprocessing.resize import resize_volume_bilinear
 from preprocessing.slice_sampling import uniform_slice_sampling
-from preprocessing.augmentation import random_augmentation
 
+INPUT_DIM = 224
+MAX_PIXEL_VAL = 255
+MEAN = 58.09
+STDDEV = 49.73
 
-class MRDataset(data.Dataset):
-    def __init__(
-        self,
-        task: str = 'acl',
-        split: str = 'train',
-        data_root: str = './data',
-        label_root: str = './labels',
-        target_slices: int = 32,
-        image_size: int = 224,
-        augment: bool = False,
-    ):
+class MRData(data.Dataset):
+    def __init__(self, task='acl', train=True, transform=None, weights=None, target_slices=32, input_dim=INPUT_DIM):
         super().__init__()
         self.planes = ['axial', 'coronal', 'sagittal']
-        self.task = task
-        self.split = split
-        self.data_root = data_root
-        self.label_root = label_root
-        self.target_slices = target_slices
-        self.image_size = image_size
-        self.augment = augment
-
-        # Doc danh sach label
         self.records = None
-        self.labels = None
-        self.has_label = True
+        self.image_path = {}
+        self.target_slices = target_slices
+        self.input_dim = input_dim
 
-        label_path = os.path.join(self.label_root, f'{split}-{task}.csv')
-        if os.path.exists(label_path):
-            self.records = pd.read_csv(label_path, header=None, names=['id', 'label'])
-            self.labels = self.records['label'].tolist()
+        if train:
+            self.records = pd.read_csv('./images/train-{}.csv'.format(task), header=None, names=['id', 'label'])
+            for plane in self.planes:
+                self.image_path[plane] = './images/train/{}/'.format(plane)
         else:
-            # Neu khong co label (vi du: test), tao danh sach rong
-            self.has_label = False
-            self.records = None
-            self.labels = []
+            transform = None
+            self.records = pd.read_csv('./images/valid-{}.csv'.format(task), header=None, names=['id', 'label'])
+            for plane in self.planes:
+                self.image_path[plane] = './images/valid/{}/'.format(plane)
 
-        # Dinh dang id thanh 4 ky tu
-        if self.records is not None:
-            self.records['id'] = self.records['id'].map(lambda i: '0' * (4 - len(str(i))) + str(i))
-
-        # Tao duong dan file .npy cho moi plane
+        self.transform = transform
+        self.records['id'] = self.records['id'].map(lambda i: '0' * (4 - len(str(i))) + str(i))
+        
         self.paths = {}
         for plane in self.planes:
-            plane_dir = os.path.join(self.data_root, split, plane)
-            if self.records is not None:
-                self.paths[plane] = [os.path.join(plane_dir, f'{filename}.npy') for filename in self.records['id']]
-            else:
-                # Neu khong co label, lay toan bo file trong thu muc
-                if os.path.isdir(plane_dir):
-                    self.paths[plane] = sorted([
-                        os.path.join(plane_dir, f) for f in os.listdir(plane_dir) if f.endswith('.npy')
-                    ])
-                else:
-                    self.paths[plane] = []
+            self.paths[plane] = [self.image_path[plane] + filename + '.npy' for filename in self.records['id'].tolist()]
 
-        # Tinh weight cho loss (chi dung khi co label)
-        if self.has_label and len(self.labels) > 0:
-            pos = sum(self.labels)
-            neg = len(self.labels) - pos
-            self.pos_weight = torch.FloatTensor([neg / max(pos, 1)])
+        self.labels = self.records['label'].tolist()
+        
+        # Tính toán weight
+        pos = sum(self.labels)
+        neg = len(self.labels) - pos
+        if weights:
+            self.weights = torch.FloatTensor(weights)
         else:
-            self.pos_weight = torch.FloatTensor([1.0])
-
-        print(f'Task: {task} | Split: {split} | Samples: {self.__len__()}')
+            self.weights = torch.FloatTensor([neg / pos])
+        
+        print(f'Task: {task} | Train: {train}')
+        print(f'Samples: -ve: {neg}, +ve: {pos} | Loss Weights: {self.weights}')
 
     def __len__(self):
-        if self.records is not None:
-            return len(self.records)
-        # Neu khong co label, lay do dai theo so file o plane axial (neu co)
-        return len(self.paths.get('axial', []))
+        return len(self.records)
 
     def __getitem__(self, index):
         img_raw = {}
         for plane in self.planes:
-            volume = np.load(self.paths[plane][index])
-            img_raw[plane] = self._preprocess_volume(volume, augment=self.augment)
-
-        if self.has_label:
-            label = self.labels[index]
-            label = torch.FloatTensor([1]) if label == 1 else torch.FloatTensor([0])
-        else:
-            # Neu test khong co label, tra ve 0 de giu dung format
-            label = torch.FloatTensor([0])
+            img_raw[plane] = np.load(self.paths[plane][index])
+            if self.target_slices is not None:
+                img_raw[plane] = uniform_slice_sampling(img_raw[plane], self.target_slices)
+            img_raw[plane] = self._resize_image(img_raw[plane])
+            
+        label = self.labels[index]
+        label = torch.FloatTensor([1]) if label == 1 else torch.FloatTensor([0])
 
         return [img_raw[plane] for plane in self.planes], label
 
-    def _preprocess_volume(self, volume: np.ndarray, augment: bool = False) -> torch.Tensor:
-        # 1. Percentile Clipping (loai bo nhieu cuong do)
-        volume = percentile_clipping(volume)
+    def _resize_image(self, image):
+        # 1. Resize/Crop (Cắt giữa ảnh)
+        target = self.input_dim
+        if target is not None and target <= image.shape[1] and target <= image.shape[2]:
+            pad = int((image.shape[2] - target) / 2)
+            image = image[:, pad:-pad, pad:-pad]
+        
+        # 2. Normalize (Chuẩn hóa)
+        image = (image - np.min(image)) / (np.max(image) - np.min(image)) * MAX_PIXEL_VAL
+        image = (image - MEAN) / STDDEV
 
-        # 2. Z-score normalization (chuan hoa cuong do pixel)
-        volume = z_score_normalize(volume)
+        # 3. Chuyển sang Tensor
+        image = torch.FloatTensor(image)
 
-        # 3. Uniform slice sampling (dua ve so slice co dinh)
-        volume = uniform_slice_sampling(volume, target_slices=self.target_slices)
+        # 4. QUAN TRỌNG: Tạo 3 kênh màu (RGB)
+        # Input đang là (Slices, H, W) -> Stack thành (Slices, 3, H, W)
+        image = torch.stack((image,)*3, axis=1)
 
-        # 4. Resize bang bilinear interpolation (dua ve cung kich thuoc)
-        volume = resize_volume_bilinear(volume, target_size=self.image_size)
+        # 5. Apply Transform (Nếu có)
+        if self.transform:
+            # Lúc này image có dạng (Slices, 3, H, W)
+            # torchvision sẽ coi 'Slices' là batch và áp dụng transform lên từng slice
+            image = self.transform(image)
 
-        # 5. Chuyen sang Tensor
-        volume_tensor = torch.from_numpy(volume).float()  # (S, H, W)
+        return image
 
-        # 6. Augmentation (chi cho train)
-        if augment:
-            volume_tensor = random_augmentation(volume_tensor)
+def load_data(task: str, batch_size: int = 1, num_workers: int = 0, target_slices: int = 32, image_size: int = INPUT_DIM):
+    # Định nghĩa Augmentation
+    # Lưu ý: Không cần bước repeat/permute nữa vì đã làm trong _resize_image
+    augments = transforms.Compose([
+        transforms.RandomRotation(25),
+        transforms.RandomAffine(degrees=0, translate=(0.11, 0.11)),
+        transforms.RandomHorizontalFlip(),
+    ])
 
-        # 7. Tao 3 kenh mau (RGB gia) de phu hop backbone
-        volume_tensor = volume_tensor.unsqueeze(1).repeat(1, 3, 1, 1)
-
-        return volume_tensor
-
-
-def load_data(
-    task: str,
-    batch_size: int = 1,
-    num_workers: int = 0,
-    target_slices: int = 32,
-    image_size: int = 224,
-):
-    # Tao Dataset cho train/valid/test
-    train_data = MRDataset(
-        task=task,
-        split='train',
-        target_slices=target_slices,
-        image_size=image_size,
-        augment=True,
-    )
-    valid_data = MRDataset(
-        task=task,
-        split='valid',
-        target_slices=target_slices,
-        image_size=image_size,
-        augment=False,
-    )
-    test_data = MRDataset(
-        task=task,
-        split='test',
-        target_slices=target_slices,
-        image_size=image_size,
-        augment=False,
-    )
-
-    # Tao DataLoader
+    print('Loading Train Dataset of {} task...'.format(task))
+    train_data = MRData(task, train=True, transform=augments, target_slices=target_slices, input_dim=image_size)
+    # num_workers=0 để tránh lỗi trên Windows
     train_loader = data.DataLoader(train_data, batch_size=batch_size, num_workers=num_workers, shuffle=True)
-    valid_loader = data.DataLoader(valid_data, batch_size=batch_size, num_workers=num_workers, shuffle=False)
-    test_loader = data.DataLoader(test_data, batch_size=batch_size, num_workers=num_workers, shuffle=False)
 
-    return train_loader, valid_loader, test_loader
+    print('Loading Validation Dataset of {} task...'.format(task))
+    val_data = MRData(task, train=False, target_slices=target_slices, input_dim=image_size)
+    val_loader = data.DataLoader(val_data, batch_size=batch_size, num_workers=num_workers, shuffle=False)
+
+    return train_loader, val_loader, train_data.weights, val_data.weights

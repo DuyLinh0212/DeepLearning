@@ -23,7 +23,10 @@ def _evaluate_model(model, val_loader, criterion, epoch, num_epochs, writer, cur
     losses = []
 
     # Iterate over the validation dataset
-    for i, (images, label) in enumerate(val_loader):
+    for i, batch in enumerate(val_loader):
+        if batch is None:
+            continue
+        images, label = batch
         # If GPU is available, load the images and label
         # on GPU
         if torch.cuda.is_available():
@@ -91,7 +94,10 @@ def _train_model(model, train_loader, epoch, num_epochs, optimizer, criterion, w
     losses = []
 
     # Iterate over the training dataset
-    for i, (images, label) in enumerate(train_loader):
+    for i, batch in enumerate(train_loader):
+        if batch is None:
+            continue
+        images, label = batch
         # Reset the gradient by zeroing it
         optimizer.zero_grad()
         

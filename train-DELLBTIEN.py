@@ -5,7 +5,7 @@ import torch.utils.data as data
 from torch.utils.tensorboard import SummaryWriter
 
 from dataset import load_data
-from models import MRnet
+from models.Enhanced_MRNet import MRnet
 from config import config
 from utils import _train_model, _evaluate_model, _get_lr
 
@@ -34,13 +34,17 @@ def train(config : dict):
     best_model_path = os.path.join(save_folder, 'best_model.pth')
 
     print('Starting to Train Model...')
-    train_loader, val_loader, train_wts, val_wts = load_data(
+    train_loader, val_loader, test_loader = load_data(
         config['task'],
         batch_size=config['batch_size'],
-        num_workers=config['num_workers'],
-        target_slices=config['target_slices'],
-        image_size=config['image_size'],
+        num_workers=config.get('num_workers', 0),
+        target_slices=config.get('target_slices', 32),
+        image_size=config.get('image_size', 224),
     )
+
+    # Lay pos_weight tu dataset
+    train_wts = train_loader.dataset.pos_weight
+    val_wts = val_loader.dataset.pos_weight
 
     print('Initializing Model...')
     model = MRnet()
@@ -69,17 +73,23 @@ def train(config : dict):
     best_val_auc = float(0)
     
     # --- ĐOẠN CODE MỚI: KIỂM TRA ĐỂ RESUME (CHẠY TIẾP) ---
+    # --- KIEM TRA CHECKPOINT DE RESUME ---
     if os.path.exists(checkpoint_path):
         print(f"Found checkpoint at {checkpoint_path}. Loading...")
-        checkpoint = torch.load(checkpoint_path)
-        
-        model.load_state_dict(checkpoint['model_state_dict'])
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        starting_epoch = checkpoint['epoch'] + 1 # Bắt đầu từ epoch tiếp theo
-        best_val_auc = checkpoint['best_val_auc']
-        
-        print(f"Resuming training from epoch {starting_epoch} with Best AUC: {best_val_auc}")
+        try:
+            # PyTorch >= 2.6 mac dinh weights_only=True, can tat neu checkpoint la tu ban
+            checkpoint = torch.load(checkpoint_path, weights_only=False)
+
+            model.load_state_dict(checkpoint['model_state_dict'])
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            starting_epoch = checkpoint['epoch'] + 1
+            best_val_auc = checkpoint['best_val_auc']
+
+            print(f"Resuming training from epoch {starting_epoch} with Best AUC: {best_val_auc}")
+        except Exception as e:
+            print(f"Khong load duoc checkpoint, bo qua va train moi. Ly do: {e}")
+            print("Starting from scratch.")
     else:
         print("No checkpoint found. Starting from scratch.")
     # -----------------------------------------------------
