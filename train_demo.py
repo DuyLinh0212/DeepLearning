@@ -16,6 +16,10 @@ from utils import _get_lr
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+try:
+    from tqdm import tqdm
+except Exception:
+    tqdm = None
 
 
 def _build_model(name: str):
@@ -27,7 +31,7 @@ def _build_model(name: str):
     raise ValueError(f"Unsupported model: {name}")
 
 
-def _run_epoch(model, loader, criterion, optimizer=None, device="cpu"):
+def _run_epoch(model, loader, criterion, optimizer=None, device="cpu", phase="train"):
     is_train = optimizer is not None
     model.train() if is_train else model.eval()
 
@@ -35,7 +39,11 @@ def _run_epoch(model, loader, criterion, optimizer=None, device="cpu"):
     y_prob = []
     losses = []
 
-    for batch in loader:
+    iterator = loader
+    if tqdm is not None:
+        iterator = tqdm(loader, desc=phase, leave=False)
+
+    for batch in iterator:
         if batch is None:
             continue
         images, label = batch
@@ -210,10 +218,10 @@ def train(config: dict, model_name: str):
         epoch_start_time = time.time()
 
         train_loss, train_auc, train_acc, _, _, _ = _run_epoch(
-            model, train_loader, criterion, optimizer=optimizer, device=device
+            model, train_loader, criterion, optimizer=optimizer, device=device, phase="train"
         )
         val_loss, val_auc, val_acc, _, _, _ = _run_epoch(
-            model, val_loader, val_criterion, optimizer=None, device=device
+            model, val_loader, val_criterion, optimizer=None, device=device, phase="val"
         )
 
         writer.add_scalar("Train/Avg Loss", train_loss, epoch)
@@ -278,7 +286,7 @@ def train(config: dict, model_name: str):
 
     model.eval()
     _, _, _, y_true, y_prob, y_pred = _run_epoch(
-        model, val_loader, val_criterion, optimizer=None, device=device
+        model, val_loader, val_criterion, optimizer=None, device=device, phase="val"
     )
 
     _plot_curves(csv_path, os.path.join(eval_folder, f"{model_name}_{config['task']}_curves.png"))
