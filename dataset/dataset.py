@@ -23,12 +23,12 @@ class MRData(data.Dataset):
         self.input_dim = input_dim
 
         if train:
-            self.records = pd.read_csv('./images/train-{}.csv'.format(task), header=None, names=['id', 'label'])
+            self.records = pd.read_csv('./labels/train-{}.csv'.format(task), header=None, names=['id', 'label'])
             for plane in self.planes:
                 self.image_path[plane] = './images/train/{}/'.format(plane)
         else:
             transform = None
-            self.records = pd.read_csv('./images/valid-{}.csv'.format(task), header=None, names=['id', 'label'])
+            self.records = pd.read_csv('./labels/valid-{}.csv'.format(task), header=None, names=['id', 'label'])
             for plane in self.planes:
                 self.image_path[plane] = './images/valid/{}/'.format(plane)
 
@@ -41,7 +41,7 @@ class MRData(data.Dataset):
 
         self.labels = self.records['label'].tolist()
         
-        # Tính toán weight
+        # T??nh to??n weight
         pos = sum(self.labels)
         neg = len(self.labels) - pos
         if weights:
@@ -69,34 +69,34 @@ class MRData(data.Dataset):
         return [img_raw[plane] for plane in self.planes], label
 
     def _resize_image(self, image):
-        # 1. Resize/Crop (Cắt giữa ảnh)
+        # 1. Resize/Crop (C???t gi???a ???nh)
         target = self.input_dim
         if target is not None and target <= image.shape[1] and target <= image.shape[2]:
             pad = int((image.shape[2] - target) / 2)
             image = image[:, pad:-pad, pad:-pad]
         
-        # 2. Normalize (Chuẩn hóa)
+        # 2. Normalize (Chu???n h??a)
         image = (image - np.min(image)) / (np.max(image) - np.min(image)) * MAX_PIXEL_VAL
         image = (image - MEAN) / STDDEV
 
-        # 3. Chuyển sang Tensor
+        # 3. Chuy???n sang Tensor
         image = torch.FloatTensor(image)
 
-        # 4. QUAN TRỌNG: Tạo 3 kênh màu (RGB)
-        # Input đang là (Slices, H, W) -> Stack thành (Slices, 3, H, W)
+        # 4. QUAN TR???NG: T???o 3 k??nh m??u (RGB)
+        # Input ??ang l?? (Slices, H, W) -> Stack th??nh (Slices, 3, H, W)
         image = torch.stack((image,)*3, axis=1)
 
-        # 5. Apply Transform (Nếu có)
+        # 5. Apply Transform (N???u c??)
         if self.transform:
-            # Lúc này image có dạng (Slices, 3, H, W)
-            # torchvision sẽ coi 'Slices' là batch và áp dụng transform lên từng slice
+            # L??c n??y image c?? d???ng (Slices, 3, H, W)
+            # torchvision s??? coi 'Slices' l?? batch v?? ??p d???ng transform l??n t???ng slice
             image = self.transform(image)
 
         return image
 
 def load_data(task: str, batch_size: int = 1, num_workers: int = 0, target_slices: int = 32, image_size: int = INPUT_DIM):
-    # Định nghĩa Augmentation
-    # Lưu ý: Không cần bước repeat/permute nữa vì đã làm trong _resize_image
+    # ?????nh ngh??a Augmentation
+    # L??u ??: Kh??ng c???n b?????c repeat/permute n???a v?? ???? l??m trong _resize_image
     augments = transforms.Compose([
         transforms.RandomRotation(25),
         transforms.RandomAffine(degrees=0, translate=(0.11, 0.11)),
@@ -105,7 +105,7 @@ def load_data(task: str, batch_size: int = 1, num_workers: int = 0, target_slice
 
     print('Loading Train Dataset of {} task...'.format(task))
     train_data = MRData(task, train=True, transform=augments, target_slices=target_slices, input_dim=image_size)
-    # num_workers=0 để tránh lỗi trên Windows
+    # num_workers=0 ????? tr??nh l???i tr??n Windows
     train_loader = data.DataLoader(train_data, batch_size=batch_size, num_workers=num_workers, shuffle=True)
 
     print('Loading Validation Dataset of {} task...'.format(task))
