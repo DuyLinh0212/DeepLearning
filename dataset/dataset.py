@@ -25,12 +25,12 @@ class MRData(data.Dataset):
         if train:
             self.records = pd.read_csv('./labels/train-{}.csv'.format(task), header=None, names=['id', 'label'])
             for plane in self.planes:
-                self.image_path[plane] = './images/train/{}/'.format(plane)
+                self.image_path[plane] = './data/train/{}/'.format(plane)
         else:
             transform = None
             self.records = pd.read_csv('./labels/valid-{}.csv'.format(task), header=None, names=['id', 'label'])
             for plane in self.planes:
-                self.image_path[plane] = './images/valid/{}/'.format(plane)
+                self.image_path[plane] = './data/valid/{}/'.format(plane)
 
         self.transform = transform
         self.records['id'] = self.records['id'].map(lambda i: '0' * (4 - len(str(i))) + str(i))
