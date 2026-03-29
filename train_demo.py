@@ -199,6 +199,18 @@ def train(config: dict, model_name: str):
     num_epochs = config["max_epoch"]
     best_val_auc = float(0)
 
+    if os.path.exists(last_model_path):
+        print(f"Found checkpoint at {last_model_path}. Loading...")
+        checkpoint = torch.load(last_model_path, map_location=device)
+        model.load_state_dict(checkpoint["model_state_dict"])
+        if "optimizer_state_dict" in checkpoint:
+            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        if "scheduler_state_dict" in checkpoint:
+            scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+        starting_epoch = checkpoint.get("epoch", starting_epoch) + 1
+        best_val_auc = checkpoint.get("best_val_auc", best_val_auc)
+        print(f"Resuming from epoch {starting_epoch} | Best AUC {best_val_auc:.4f}")
+
     writer = SummaryWriter(comment=f"model={model_name} lr={config['lr']} task={config['task']}")
     t_start_training = time.time()
 
@@ -256,6 +268,8 @@ def train(config: dict, model_name: str):
             torch.save(
                 {
                     "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "scheduler_state_dict": scheduler.state_dict(),
                     "epoch": epoch,
                     "best_val_auc": best_val_auc,
                     "model_name": model_name,
@@ -266,6 +280,8 @@ def train(config: dict, model_name: str):
         torch.save(
             {
                 "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "scheduler_state_dict": scheduler.state_dict(),
                 "epoch": epoch,
                 "best_val_auc": best_val_auc,
                 "model_name": model_name,
