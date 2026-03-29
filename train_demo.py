@@ -203,10 +203,7 @@ def train(config: dict, model_name: str):
         print(f"Found checkpoint at {last_model_path}. Loading...")
         checkpoint = torch.load(last_model_path, map_location=device)
         model.load_state_dict(checkpoint["model_state_dict"])
-        if "optimizer_state_dict" in checkpoint:
-            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-        if "scheduler_state_dict" in checkpoint:
-            scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+        # Do not load optimizer/scheduler states to allow new LR from config
         starting_epoch = checkpoint.get("epoch", starting_epoch) + 1
         best_val_auc = checkpoint.get("best_val_auc", best_val_auc)
         print(f"Resuming from epoch {starting_epoch} | Best AUC {best_val_auc:.4f}")
@@ -318,7 +315,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--model",
         type=str,
-        default="densenet121",
+        default="efficientnetb0",
         choices=["densenet121", "efficientnetb0"],
         help="Choose model to train",
     )
