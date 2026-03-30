@@ -30,6 +30,10 @@ def random_augmentation(volume: torch.Tensor, seed: Optional[int] = None) -> tor
         random.seed(seed)
         torch.manual_seed(seed)
 
+    # ensure float tensor for ops like randn_like
+    if volume.dtype != torch.float32:
+        volume = volume.float()
+
     ops = ['rotate', 'hflip', 'crop', 'noise']
     op = random.choice(ops)
 
