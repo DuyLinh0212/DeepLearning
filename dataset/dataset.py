@@ -4,6 +4,7 @@ import numpy as np
 
 import torch
 import torch.utils.data as data
+from torch.utils.data import WeightedRandomSampler
 from torchvision import transforms
 
 from preprocessing.slice_sampling import uniform_slice_sampling
@@ -111,8 +112,14 @@ def load_data(task: str, batch_size: int = 1, num_workers: int = 0, target_slice
 
     print('Loading Train Dataset of {} task...'.format(task))
     train_data = MRData(task, train=True, transform=augments, target_slices=target_slices, input_dim=image_size)
+    # Weighted sampling to balance classes in each batch
+    labels = train_data.labels
+    class_counts = np.bincount(labels)
+    class_weights = 1.0 / np.maximum(class_counts, 1)
+    sample_weights = class_weights[labels]
+    sampler = WeightedRandomSampler(weights=sample_weights, num_samples=len(sample_weights), replacement=True)
     # num_workers=0 ????? tr??nh l???i tr??n Windows
-    train_loader = data.DataLoader(train_data, batch_size=batch_size, num_workers=num_workers, shuffle=True)
+    train_loader = data.DataLoader(train_data, batch_size=batch_size, num_workers=num_workers, sampler=sampler)
 
     print('Loading Validation Dataset of {} task...'.format(task))
     val_data = MRData(task, train=False, target_slices=target_slices, input_dim=image_size)
