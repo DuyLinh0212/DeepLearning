@@ -198,12 +198,15 @@ def train(config: dict, model_name: str):
     starting_epoch = config["starting_epoch"]
     num_epochs = config["max_epoch"]
     best_val_auc = float(0)
+    patience = config.get("patience", 5)
+    epochs_no_improve = 0
 
     if os.path.exists(last_model_path):
         print(f"Found checkpoint at {last_model_path}. Loading...")
         checkpoint = torch.load(last_model_path, map_location=device)
         model.load_state_dict(checkpoint["model_state_dict"])
-        # Do not load optimizer/scheduler states to allow new LR from config
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
         starting_epoch = checkpoint.get("epoch", starting_epoch) + 1
         best_val_auc = checkpoint.get("best_val_auc", best_val_auc)
         print(f"Resuming from epoch {starting_epoch} | Best AUC {best_val_auc:.4f}")
@@ -259,8 +262,10 @@ def train(config: dict, model_name: str):
             header,
         )
 
-        if val_auc > best_val_auc:
+        improved = val_auc > best_val_auc
+        if improved:
             best_val_auc = val_auc
+            epochs_no_improve = 0
             print(f"*** New Best AUC: {best_val_auc:.4f}. Saving best model for {model_name}...")
             torch.save(
                 {
@@ -286,6 +291,12 @@ def train(config: dict, model_name: str):
             last_model_path,
         )
         print(f"Checkpoint saved to {last_model_path}")
+
+        if not improved:
+            epochs_no_improve += 1
+        if epochs_no_improve >= patience:
+            print(f"Early stopping: no improvement in {patience} epochs.")
+            break
 
     t_end_training = time.time()
     print(f"Training finished. Total time: {t_end_training - t_start_training:.2f} s")
@@ -319,10 +330,19 @@ if __name__ == "__main__":
         choices=["densenet121", "efficientnetb0"],
         help="Choose model to train",
     )
+    parser.add_argument(
+        "--tasks",
+        type=str,
+        default="abnormal,acl,meniscus",
+        help="Comma-separated tasks to train (default: abnormal,acl,meniscus)",
+    )
     args = parser.parse_args()
 
-    cfg = dict(base_config)
-    print("Training Configuration")
-    print(cfg)
-    train(config=cfg, model_name=args.model)
+    tasks = [t.strip() for t in args.tasks.split(",") if t.strip()]
+    for task in tasks:
+        cfg = dict(base_config)
+        cfg["task"] = task
+        print("Training Configuration")
+        print(cfg)
+        train(config=cfg, model_name=args.model)
     print("Training Ended...")
