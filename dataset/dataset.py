@@ -7,6 +7,7 @@ import torch.utils.data as data
 from torchvision import transforms
 
 from preprocessing.slice_sampling import uniform_slice_sampling
+from preprocessing.augmentation import random_augmentation
 
 INPUT_DIM = 224
 MAX_PIXEL_VAL = 255
@@ -21,6 +22,7 @@ class MRData(data.Dataset):
         self.image_path = {}
         self.target_slices = target_slices
         self.input_dim = input_dim
+        self.train = train
 
         if train:
             self.records = pd.read_csv('./labels/train-{}.csv'.format(task), header=None, names=['id', 'label'])
@@ -61,6 +63,10 @@ class MRData(data.Dataset):
             img_raw[plane] = np.load(self.paths[plane][index])
             if self.target_slices is not None:
                 img_raw[plane] = uniform_slice_sampling(img_raw[plane], self.target_slices)
+            if self.train:
+                vol = torch.from_numpy(img_raw[plane])
+                vol = random_augmentation(vol)
+                img_raw[plane] = vol.numpy()
             img_raw[plane] = self._resize_image(img_raw[plane])
             
         label = self.labels[index]
