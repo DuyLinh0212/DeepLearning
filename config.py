@@ -7,7 +7,7 @@ config = {
     'log_val' : 10,
     'task' : 'acl', # "meniscus" and  "acl" are the other options
     'weight_decay' : 1e-4,
-    'patience' : 4,
+    'patience' : 10,
     'save_model' : 1,
     'exp_name' : 'test',
     # Colab-friendly defaults to reduce GPU memory
