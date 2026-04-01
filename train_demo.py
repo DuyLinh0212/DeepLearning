@@ -154,6 +154,27 @@ def _plot_roc(y_true, y_prob, out_path):
     plt.close()
 
 
+def _compute_confusion_metrics(y_true, y_pred):
+    cm = metrics.confusion_matrix(y_true, y_pred)
+    tn, fp, fn, tp = cm.ravel()
+    sensitivity = tp / (tp + fn) if (tp + fn) else 0.0
+    specificity = tn / (tn + fp) if (tn + fp) else 0.0
+    precision = tp / (tp + fp) if (tp + fp) else 0.0
+    accuracy = (tp + tn) / (tp + tn + fp + fn) if (tp + tn + fp + fn) else 0.0
+    f1 = 2 * precision * sensitivity / (precision + sensitivity) if (precision + sensitivity) else 0.0
+    return {
+        "tn": int(tn),
+        "fp": int(fp),
+        "fn": int(fn),
+        "tp": int(tp),
+        "accuracy": float(accuracy),
+        "precision": float(precision),
+        "sensitivity": float(sensitivity),
+        "specificity": float(specificity),
+        "f1": float(f1),
+    }
+
+
 def train(config: dict, model_name: str):
     save_folder = os.path.join("weights", config["task"])
     os.makedirs(save_folder, exist_ok=True)
@@ -317,8 +338,25 @@ def train(config: dict, model_name: str):
     _plot_confusion_matrix(y_true, y_pred, os.path.join(eval_folder, f"{model_name}_{config['task']}_confusion.png"))
     _plot_roc(y_true, y_prob, os.path.join(eval_folder, f"{model_name}_{config['task']}_roc.png"))
 
+    metrics_summary = _compute_confusion_metrics(y_true, y_pred)
+    summary_path = os.path.join(eval_folder, f"{model_name}_{config['task']}_summary.txt")
+    with open(summary_path, "w", encoding="utf-8") as f:
+        for k, v in metrics_summary.items():
+            f.write(f"{k}: {v}\n")
+
+    print(
+        "Summary | Acc {:.4f} | Sens {:.4f} | Spec {:.4f} | Prec {:.4f} | F1 {:.4f}".format(
+            metrics_summary["accuracy"],
+            metrics_summary["sensitivity"],
+            metrics_summary["specificity"],
+            metrics_summary["precision"],
+            metrics_summary["f1"],
+        )
+    )
+
     print(f"Metrics saved to: {csv_path}")
     print(f"Plots saved to: {eval_folder}")
+    print(f"Summary saved to: {summary_path}")
 
 
 if __name__ == "__main__":
