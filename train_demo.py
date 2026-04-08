@@ -12,7 +12,7 @@ from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 
 from dataset import load_data
-from dataset.dataset import INPUT_DIM, MAX_PIXEL_VAL, MEAN, STDDEV
+from dataset.dataset import INPUT_DIM
 from preprocessing.slice_sampling import uniform_slice_sampling
 from preprocessing.augmentation import random_augmentation
 from config import config as base_config
@@ -89,8 +89,11 @@ class MRDataByIds(Dataset):
             pad = int((image.shape[2] - target) / 2)
             image = image[:, pad:-pad, pad:-pad]
 
-        image = (image - np.min(image)) / (np.max(image) - np.min(image)) * MAX_PIXEL_VAL
-        image = (image - MEAN) / STDDEV
+        mean = float(np.mean(image))
+        std = float(np.std(image))
+        if std == 0:
+            std = 1.0
+        image = (image - mean) / std
         image = torch.FloatTensor(image)
         image = torch.stack((image,) * 3, axis=1)
         if self.transform:
@@ -127,9 +130,8 @@ def _read_task_labels(labels_dir, task):
 def _load_data_from_ids(ids_train, ids_val, labels_map, batch_size, num_workers, target_slices, image_size, data_dir):
     augments = transforms.Compose(
         [
-            transforms.RandomRotation(25),
-            transforms.RandomAffine(degrees=0, translate=(0.11, 0.11)),
-            transforms.RandomHorizontalFlip(),
+            transforms.RandomRotation(15),
+            transforms.RandomAffine(degrees=0, translate=(0.05, 0.05)),
         ]
     )
 
@@ -157,7 +159,18 @@ def _load_data_from_ids(ids_train, ids_val, labels_map, batch_size, num_workers,
     return train_loader, val_loader, train_data.weights, val_data.weights
 
 
-def _run_epoch(model, loader, criterion, optimizer=None, device="cpu", phase="train", threshold=0.5):
+def _best_threshold(y_true, y_prob):
+    try:
+        fpr, tpr, thresholds = metrics.roc_curve(y_true, y_prob)
+        if len(thresholds) == 0:
+            return 0.5
+        idx = int(np.argmax(tpr - fpr))
+        return float(thresholds[idx])
+    except Exception:
+        return 0.5
+
+
+def _run_epoch(model, loader, criterion, optimizer=None, device="cpu", phase="train", threshold=0.5, auto_threshold=False):
     is_train = optimizer is not None
     model.train() if is_train else model.eval()
 
@@ -204,10 +217,12 @@ def _run_epoch(model, loader, criterion, optimizer=None, device="cpu", phase="tr
     except Exception:
         auc = 0.5
 
+    if auto_threshold:
+        threshold = _best_threshold(y_true, y_prob)
     y_pred = [1 if p >= threshold else 0 for p in y_prob]
     acc = metrics.accuracy_score(y_true, y_pred)
     loss_mean = float(np.mean(losses))
-    return loss_mean, float(auc), float(acc), y_true, y_prob, y_pred
+    return loss_mean, float(auc), float(acc), y_true, y_prob, y_pred, float(threshold)
 
 
 def _append_csv(csv_path, row, header):
@@ -377,6 +392,7 @@ def train(config: dict, model_name: str, loaders=None, fold_idx=None, resume=Tru
         "val_loss",
         "val_auc",
         "val_acc",
+        "best_threshold",
         "lr",
     ]
 
@@ -384,11 +400,24 @@ def train(config: dict, model_name: str, loaders=None, fold_idx=None, resume=Tru
         current_lr = _get_lr(optimizer)
         epoch_start_time = time.time()
 
-        train_loss, train_auc, train_acc, _, _, _ = _run_epoch(
-            model, train_loader, criterion, optimizer=optimizer, device=device, phase="train", threshold=threshold
+        train_loss, train_auc, train_acc, _, _, _, _ = _run_epoch(
+            model,
+            train_loader,
+            criterion,
+            optimizer=optimizer,
+            device=device,
+            phase="train",
+            threshold=threshold,
         )
-        val_loss, val_auc, val_acc, _, _, _ = _run_epoch(
-            model, val_loader, val_criterion, optimizer=None, device=device, phase="val", threshold=threshold
+        val_loss, val_auc, val_acc, _, _, _, best_thresh = _run_epoch(
+            model,
+            val_loader,
+            val_criterion,
+            optimizer=None,
+            device=device,
+            phase="val",
+            threshold=threshold,
+            auto_threshold=True,
         )
 
         writer.add_scalar("Train/Avg Loss", train_loss, epoch)
@@ -404,8 +433,17 @@ def train(config: dict, model_name: str, loaders=None, fold_idx=None, resume=Tru
         delta = t_end - epoch_start_time
         print(
             "Epoch [{}/{}] | train loss {:.4f} | train auc {:.4f} | train acc {:.4f} | "
-            "val loss {:.4f} | val auc {:.4f} | val acc {:.4f} | time {:.2f} s".format(
-                epoch, num_epochs, train_loss, train_auc, train_acc, val_loss, val_auc, val_acc, delta
+            "val loss {:.4f} | val auc {:.4f} | val acc {:.4f} | thr {:.4f} | time {:.2f} s".format(
+                epoch,
+                num_epochs,
+                train_loss,
+                train_auc,
+                train_acc,
+                val_loss,
+                val_auc,
+                val_acc,
+                best_thresh,
+                delta,
             )
         )
         print("-" * 30)
@@ -413,7 +451,7 @@ def train(config: dict, model_name: str, loaders=None, fold_idx=None, resume=Tru
 
         _append_csv(
             csv_path,
-            [epoch, train_loss, train_auc, train_acc, val_loss, val_auc, val_acc, current_lr],
+            [epoch, train_loss, train_auc, train_acc, val_loss, val_auc, val_acc, best_thresh, current_lr],
             header,
         )
 
@@ -464,8 +502,15 @@ def train(config: dict, model_name: str, loaders=None, fold_idx=None, resume=Tru
         model.load_state_dict(checkpoint["model_state_dict"])
 
     model.eval()
-    _, _, _, y_true, y_prob, y_pred = _run_epoch(
-        model, val_loader, val_criterion, optimizer=None, device=device, phase="val", threshold=threshold
+    _, _, _, y_true, y_prob, y_pred, best_thresh = _run_epoch(
+        model,
+        val_loader,
+        val_criterion,
+        optimizer=None,
+        device=device,
+        phase="val",
+        threshold=threshold,
+        auto_threshold=True,
     )
 
     _plot_curves(csv_path, os.path.join(eval_folder, f"{model_name}_{config['task']}_curves.png"))
@@ -473,6 +518,7 @@ def train(config: dict, model_name: str, loaders=None, fold_idx=None, resume=Tru
     _plot_roc(y_true, y_prob, os.path.join(eval_folder, f"{model_name}_{config['task']}_roc.png"))
 
     metrics_summary = _compute_confusion_metrics(y_true, y_pred)
+    metrics_summary["best_threshold"] = float(best_thresh)
     summary_path = os.path.join(eval_folder, f"{model_name}_{config['task']}_summary.txt")
     with open(summary_path, "w", encoding="utf-8") as f:
         for k, v in metrics_summary.items():

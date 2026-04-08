@@ -11,9 +11,6 @@ from preprocessing.slice_sampling import uniform_slice_sampling
 from preprocessing.augmentation import random_augmentation
 
 INPUT_DIM = 224
-MAX_PIXEL_VAL = 255
-MEAN = 58.09
-STDDEV = 49.73
 
 class MRData(data.Dataset):
     def __init__(self, task='acl', train=True, transform=None, weights=None, target_slices=32, input_dim=INPUT_DIM):
@@ -82,9 +79,12 @@ class MRData(data.Dataset):
             pad = int((image.shape[2] - target) / 2)
             image = image[:, pad:-pad, pad:-pad]
         
-        # 2. Normalize (Chu???n h??a)
-        image = (image - np.min(image)) / (np.max(image) - np.min(image)) * MAX_PIXEL_VAL
-        image = (image - MEAN) / STDDEV
+        # 2. Normalize per-volume (z-score)
+        mean = float(np.mean(image))
+        std = float(np.std(image))
+        if std == 0:
+            std = 1.0
+        image = (image - mean) / std
 
         # 3. Chuy???n sang Tensor
         image = torch.FloatTensor(image)
@@ -105,9 +105,8 @@ def load_data(task: str, batch_size: int = 1, num_workers: int = 0, target_slice
     # ?????nh ngh??a Augmentation
     # L??u ??: Kh??ng c???n b?????c repeat/permute n???a v?? ???? l??m trong _resize_image
     augments = transforms.Compose([
-        transforms.RandomRotation(25),
-        transforms.RandomAffine(degrees=0, translate=(0.11, 0.11)),
-        transforms.RandomHorizontalFlip(),
+        transforms.RandomRotation(15),
+        transforms.RandomAffine(degrees=0, translate=(0.05, 0.05)),
     ])
 
     print('Loading Train Dataset of {} task...'.format(task))
