@@ -8,7 +8,7 @@ import torch
 from sklearn import metrics
 from sklearn.model_selection import StratifiedKFold
 from torch.utils.tensorboard import SummaryWriter
-from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
+from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 
 from dataset import load_data
@@ -142,12 +142,7 @@ def _load_data_from_ids(ids_train, ids_val, labels_map, batch_size, num_workers,
         target_slices=target_slices,
         input_dim=image_size,
     )
-    labels = train_data.labels
-    class_counts = np.bincount(labels) if len(labels) > 0 else np.array([1, 1])
-    class_weights = 1.0 / np.maximum(class_counts, 1)
-    sample_weights = class_weights[labels]
-    sampler = WeightedRandomSampler(weights=sample_weights, num_samples=len(sample_weights), replacement=True)
-    train_loader = DataLoader(train_data, batch_size=batch_size, num_workers=num_workers, sampler=sampler)
+    train_loader = DataLoader(train_data, batch_size=batch_size, num_workers=num_workers, shuffle=True)
 
     val_data = MRDataByIds(
         ids_val,
@@ -162,7 +157,7 @@ def _load_data_from_ids(ids_train, ids_val, labels_map, batch_size, num_workers,
     return train_loader, val_loader, train_data.weights, val_data.weights
 
 
-def _run_epoch(model, loader, criterion, optimizer=None, device="cpu", phase="train"):
+def _run_epoch(model, loader, criterion, optimizer=None, device="cpu", phase="train", threshold=0.5):
     is_train = optimizer is not None
     model.train() if is_train else model.eval()
 
@@ -209,7 +204,7 @@ def _run_epoch(model, loader, criterion, optimizer=None, device="cpu", phase="tr
     except Exception:
         auc = 0.5
 
-    y_pred = [1 if p >= 0.5 else 0 for p in y_prob]
+    y_pred = [1 if p >= threshold else 0 for p in y_prob]
     acc = metrics.accuracy_score(y_true, y_pred)
     loss_mean = float(np.mean(losses))
     return loss_mean, float(auc), float(acc), y_true, y_prob, y_pred
@@ -306,7 +301,7 @@ def _compute_confusion_metrics(y_true, y_pred):
     }
 
 
-def train(config: dict, model_name: str, loaders=None, fold_idx=None, resume=True):
+def train(config: dict, model_name: str, loaders=None, fold_idx=None, resume=True, threshold=0.5):
     fold_suffix = f"fold_{fold_idx}" if fold_idx is not None else None
     save_folder = os.path.join("weights", config["task"])
     if fold_suffix:
@@ -390,10 +385,10 @@ def train(config: dict, model_name: str, loaders=None, fold_idx=None, resume=Tru
         epoch_start_time = time.time()
 
         train_loss, train_auc, train_acc, _, _, _ = _run_epoch(
-            model, train_loader, criterion, optimizer=optimizer, device=device, phase="train"
+            model, train_loader, criterion, optimizer=optimizer, device=device, phase="train", threshold=threshold
         )
         val_loss, val_auc, val_acc, _, _, _ = _run_epoch(
-            model, val_loader, val_criterion, optimizer=None, device=device, phase="val"
+            model, val_loader, val_criterion, optimizer=None, device=device, phase="val", threshold=threshold
         )
 
         writer.add_scalar("Train/Avg Loss", train_loss, epoch)
@@ -470,7 +465,7 @@ def train(config: dict, model_name: str, loaders=None, fold_idx=None, resume=Tru
 
     model.eval()
     _, _, _, y_true, y_prob, y_pred = _run_epoch(
-        model, val_loader, val_criterion, optimizer=None, device=device, phase="val"
+        model, val_loader, val_criterion, optimizer=None, device=device, phase="val", threshold=threshold
     )
 
     _plot_curves(csv_path, os.path.join(eval_folder, f"{model_name}_{config['task']}_curves.png"))
@@ -513,10 +508,11 @@ if __name__ == "__main__":
         default="",
         help="Comma-separated tasks to train (default: task in config.py)",
     )
-    parser.add_argument("--kfold", type=int, default=0, help="Enable K-Fold if > 1 (e.g., 4)")
+    parser.add_argument("--kfold", type=int, default=4, help="Enable K-Fold if > 1 (default: 4)")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for K-Fold split")
     parser.add_argument("--labels-dir", type=str, default="labels", help="Path to labels directory")
     parser.add_argument("--data-dir", type=str, default="data", help="Path to data directory")
+    parser.add_argument("--threshold", type=float, default=0.5, help="Threshold for converting prob to class")
     args = parser.parse_args()
 
     tasks = [t.strip() for t in args.tasks.split(",") if t.strip()]
@@ -546,7 +542,14 @@ if __name__ == "__main__":
                     data_dir=args.data_dir,
                 )
                 print(f"=== Task {task} | Fold {fold_idx + 1}/{args.kfold} ===")
-                train(config=cfg, model_name=args.model, loaders=loaders, fold_idx=fold_idx, resume=False)
+                train(
+                    config=cfg,
+                    model_name=args.model,
+                    loaders=loaders,
+                    fold_idx=fold_idx,
+                    resume=False,
+                    threshold=args.threshold,
+                )
                 # Read best AUC from checkpoint after fold
                 best_path = os.path.join("weights", task, f"fold_{fold_idx}", f"{args.model}_best_model.pth")
                 if os.path.exists(best_path):
@@ -557,5 +560,5 @@ if __name__ == "__main__":
                 std_auc = float(np.std(fold_aucs))
                 print(f"K-Fold Summary | Task {task} | AUC {mean_auc:.4f} ± {std_auc:.4f}")
         else:
-            train(config=cfg, model_name=args.model)
+            train(config=cfg, model_name=args.model, threshold=args.threshold)
     print("Training Ended...")
