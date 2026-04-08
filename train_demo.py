@@ -11,7 +11,6 @@ from torch.utils.tensorboard import SummaryWriter
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 
-from dataset import load_data
 from dataset.dataset import INPUT_DIM
 from preprocessing.slice_sampling import uniform_slice_sampling
 from preprocessing.augmentation import random_augmentation
@@ -59,10 +58,13 @@ class MRDataByIds(Dataset):
                 self.paths[plane].append(os.path.join(self.data_dir, src_split, plane, f"{rid_str}.npy"))
 
         self.labels = [self.labels_map[rid] for rid in self.ids]
-
-        pos = sum(self.labels)
-        neg = len(self.labels) - pos
-        self.weights = torch.FloatTensor([neg / pos]) if pos > 0 else torch.FloatTensor([1.0])
+        labels_arr = np.array(self.labels, dtype=np.float32)
+        if labels_arr.ndim == 1:
+            labels_arr = labels_arr.reshape(-1, 1)
+        pos = labels_arr.sum(axis=0)
+        neg = labels_arr.shape[0] - pos
+        pos_weight = np.where(pos > 0, neg / pos, 1.0)
+        self.weights = torch.FloatTensor(pos_weight)
 
     def __len__(self):
         return len(self.ids)
@@ -80,7 +82,10 @@ class MRDataByIds(Dataset):
             img_raw[plane] = self._resize_image(img_raw[plane])
 
         label = self.labels[index]
-        label = torch.FloatTensor([1]) if label == 1 else torch.FloatTensor([0])
+        label_arr = np.array(label, dtype=np.float32)
+        if label_arr.ndim == 0:
+            label_arr = label_arr.reshape(1)
+        label = torch.from_numpy(label_arr)
         return [img_raw[plane] for plane in self.planes], label
 
     def _resize_image(self, image):
@@ -114,28 +119,47 @@ def _find_source_split(data_dir, rid_str):
     return None
 
 
-def _read_split_labels(labels_dir, task, split):
-    path = os.path.join(labels_dir, f"{split}-{task}.csv")
-    data = np.genfromtxt(path, delimiter=",", dtype=int)
-    if data.ndim == 1 and data.size == 2:
-        data = np.array([data])
-    ids = []
-    labels_map = {}
-    for rid, lab in data:
-        rid = int(rid)
-        labels_map[rid] = int(lab)
-        ids.append(rid)
+def _read_split_labels_multilabel(labels_dir, tasks, split):
+    task_maps = []
+    for task in tasks:
+        path = os.path.join(labels_dir, f"{split}-{task}.csv")
+        data = np.genfromtxt(path, delimiter=",", dtype=int)
+        if data.ndim == 1 and data.size == 2:
+            data = np.array([data])
+        m = {}
+        for rid, lab in data:
+            m[int(rid)] = int(lab)
+        task_maps.append(m)
+
+    ids = set(task_maps[0].keys())
+    for m in task_maps[1:]:
+        ids = ids.intersection(m.keys())
+    ids = sorted(ids)
+
+    labels_map = {rid: [m[rid] for m in task_maps] for rid in ids}
     return ids, labels_map
 
 
-def _read_task_labels(labels_dir, task):
-    labels_map = {}
-    all_ids = []
-    for split in ["train", "valid", "test"]:
-        ids, split_map = _read_split_labels(labels_dir, task, split)
-        all_ids.extend(ids)
-        labels_map.update(split_map)
-    return sorted(all_ids), labels_map
+def _read_all_labels_multilabel(labels_dir, tasks):
+    task_maps = []
+    for task in tasks:
+        m = {}
+        for split in ["train", "valid", "test"]:
+            path = os.path.join(labels_dir, f"{split}-{task}.csv")
+            data = np.genfromtxt(path, delimiter=",", dtype=int)
+            if data.ndim == 1 and data.size == 2:
+                data = np.array([data])
+            for rid, lab in data:
+                m[int(rid)] = int(lab)
+        task_maps.append(m)
+
+    ids = set(task_maps[0].keys())
+    for m in task_maps[1:]:
+        ids = ids.intersection(m.keys())
+    ids = sorted(ids)
+
+    labels_map = {rid: [m[rid] for m in task_maps] for rid in ids}
+    return ids, labels_map
 
 
 def _load_data_from_ids(ids_train, ids_val, labels_map, batch_size, num_workers, target_slices, image_size, data_dir):
@@ -184,15 +208,24 @@ def _load_test_from_ids(ids_test, labels_map, batch_size, num_workers, target_sl
     return test_loader
 
 
-def _best_threshold(y_true, y_prob):
-    try:
-        fpr, tpr, thresholds = metrics.roc_curve(y_true, y_prob)
-        if len(thresholds) == 0:
-            return 0.5
-        idx = int(np.argmax(tpr - fpr))
-        return float(thresholds[idx])
-    except Exception:
-        return 0.5
+def _best_thresholds(y_true, y_prob):
+    y_true = np.asarray(y_true)
+    y_prob = np.asarray(y_prob)
+    if y_true.ndim == 1:
+        y_true = y_true.reshape(-1, 1)
+        y_prob = y_prob.reshape(-1, 1)
+    thresholds = []
+    for i in range(y_true.shape[1]):
+        try:
+            fpr, tpr, thr = metrics.roc_curve(y_true[:, i], y_prob[:, i])
+            if len(thr) == 0:
+                thresholds.append(0.5)
+                continue
+            idx = int(np.argmax(tpr - fpr))
+            thresholds.append(float(thr[idx]))
+        except Exception:
+            thresholds.append(0.5)
+    return thresholds
 
 
 def _run_epoch(model, loader, criterion, optimizer=None, device="cpu", phase="train", threshold=0.5, auto_threshold=False):
@@ -228,26 +261,50 @@ def _run_epoch(model, loader, criterion, optimizer=None, device="cpu", phase="tr
 
         losses.append(loss.item())
 
-        probas = torch.sigmoid(output).detach().cpu().view(-1).numpy().tolist()
-        labels = label.detach().cpu().view(-1).numpy().tolist()
+        probas = torch.sigmoid(output).detach().cpu().numpy()
+        labels = label.detach().cpu().numpy()
 
-        y_prob.extend(probas)
-        y_true.extend(labels)
+        y_prob.extend(probas.tolist())
+        y_true.extend(labels.tolist())
 
     if len(losses) == 0:
         return 0.0, 0.5, 0.0, [], [], []
 
-    try:
-        auc = metrics.roc_auc_score(y_true, y_prob)
-    except Exception:
-        auc = 0.5
+    y_true = np.asarray(y_true)
+    y_prob = np.asarray(y_prob)
+    if y_true.ndim == 1:
+        y_true = y_true.reshape(-1, 1)
+        y_prob = y_prob.reshape(-1, 1)
+
+    aucs = []
+    for i in range(y_true.shape[1]):
+        try:
+            aucs.append(metrics.roc_auc_score(y_true[:, i], y_prob[:, i]))
+        except Exception:
+            aucs.append(0.5)
+    auc = float(np.mean(aucs)) if len(aucs) else 0.5
 
     if auto_threshold:
-        threshold = _best_threshold(y_true, y_prob)
-    y_pred = [1 if p >= threshold else 0 for p in y_prob]
-    acc = metrics.accuracy_score(y_true, y_pred)
+        thresholds = _best_thresholds(y_true, y_prob)
+    else:
+        if isinstance(threshold, (list, tuple, np.ndarray)):
+            thresholds = list(threshold)
+        else:
+            thresholds = [threshold] * y_true.shape[1]
+
+    y_pred = []
+    for row in y_prob:
+        y_pred.append([1 if row[i] >= thresholds[i] else 0 for i in range(len(thresholds))])
+    y_pred = np.asarray(y_pred)
+    accs = []
+    for i in range(y_true.shape[1]):
+        try:
+            accs.append(metrics.accuracy_score(y_true[:, i], y_pred[:, i]))
+        except Exception:
+            accs.append(0.0)
+    acc = float(np.mean(accs)) if len(accs) else 0.0
     loss_mean = float(np.mean(losses))
-    return loss_mean, float(auc), float(acc), y_true, y_prob, y_pred, float(threshold)
+    return loss_mean, float(auc), float(acc), y_true, y_prob, y_pred, thresholds
 
 
 def _append_csv(csv_path, row, header):
@@ -341,6 +398,72 @@ def _compute_confusion_metrics(y_true, y_pred):
     }
 
 
+def _plot_confusion_matrix_multi(y_true, y_pred, class_names, out_dir, prefix):
+    y_true = np.asarray(y_true)
+    y_pred = np.asarray(y_pred)
+    if y_true.ndim == 1:
+        y_true = y_true.reshape(-1, 1)
+        y_pred = y_pred.reshape(-1, 1)
+    for i, name in enumerate(class_names):
+        out_path = os.path.join(out_dir, f"{prefix}_{name}_confusion.png")
+        _plot_confusion_matrix(y_true[:, i], y_pred[:, i], out_path)
+
+
+def _plot_roc_multi(y_true, y_prob, class_names, out_path):
+    y_true = np.asarray(y_true)
+    y_prob = np.asarray(y_prob)
+    if y_true.ndim == 1:
+        y_true = y_true.reshape(-1, 1)
+        y_prob = y_prob.reshape(-1, 1)
+    plt.figure(figsize=(6, 6))
+    for i, name in enumerate(class_names):
+        try:
+            fpr, tpr, _ = metrics.roc_curve(y_true[:, i], y_prob[:, i])
+            auc = metrics.auc(fpr, tpr)
+            plt.plot(fpr, tpr, label=f"{name} AUC = {auc:.4f}")
+        except Exception:
+            continue
+    plt.plot([0, 1], [0, 1], linestyle="--", color="gray")
+    plt.xlabel("False Positive Rate")
+    plt.ylabel("True Positive Rate")
+    plt.title("ROC Curve")
+    plt.legend(loc="lower right")
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(out_path)
+    plt.close()
+
+
+def _compute_confusion_metrics_multi(y_true, y_pred, class_names):
+    y_true = np.asarray(y_true)
+    y_pred = np.asarray(y_pred)
+    if y_true.ndim == 1:
+        y_true = y_true.reshape(-1, 1)
+        y_pred = y_pred.reshape(-1, 1)
+    summary = {}
+    accs = []
+    precs = []
+    sens = []
+    specs = []
+    f1s = []
+    for i, name in enumerate(class_names):
+        m = _compute_confusion_metrics(y_true[:, i], y_pred[:, i])
+        summary[name] = m
+        accs.append(m["accuracy"])
+        precs.append(m["precision"])
+        sens.append(m["sensitivity"])
+        specs.append(m["specificity"])
+        f1s.append(m["f1"])
+    summary["macro"] = {
+        "accuracy": float(np.mean(accs)) if accs else 0.0,
+        "precision": float(np.mean(precs)) if precs else 0.0,
+        "sensitivity": float(np.mean(sens)) if sens else 0.0,
+        "specificity": float(np.mean(specs)) if specs else 0.0,
+        "f1": float(np.mean(f1s)) if f1s else 0.0,
+    }
+    return summary
+
+
 def train(
     config: dict,
     model_name: str,
@@ -352,32 +475,40 @@ def train(
     data_dir="data",
     run_test=True,
 ):
+    task_name = config.get("task_name", "multilabel")
+    class_names = config.get("tasks", ["abnormal", "acl", "meniscus"])
     fold_suffix = f"fold_{fold_idx}" if fold_idx is not None else None
-    save_folder = os.path.join("weights", config["task"])
+    save_folder = os.path.join("weights", task_name)
     if fold_suffix:
         save_folder = os.path.join(save_folder, fold_suffix)
     os.makedirs(save_folder, exist_ok=True)
 
-    eval_folder = os.path.join("evaluation", f"{model_name}_{config['task']}")
+    eval_folder = os.path.join("evaluation", f"{model_name}_{task_name}")
     if fold_suffix:
         eval_folder = os.path.join(eval_folder, fold_suffix)
     os.makedirs(eval_folder, exist_ok=True)
 
-    csv_path = os.path.join(eval_folder, f"{model_name}_{config['task']}_metrics.csv")
+    csv_path = os.path.join(eval_folder, f"{model_name}_{task_name}_metrics.csv")
     best_model_path = os.path.join(save_folder, f"{model_name}_best_model.pth")
     last_model_path = os.path.join(save_folder, f"{model_name}_last_checkpoint.pth")
 
     print("Starting to Train Model...")
     if loaders is None:
-        train_loader, val_loader, train_wts, val_wts = load_data(
-            config["task"],
+        train_ids, train_map = _read_split_labels_multilabel(labels_dir, class_names, "train")
+        val_ids, val_map = _read_split_labels_multilabel(labels_dir, class_names, "valid")
+        labels_map = {**train_map, **val_map}
+        train_loader, val_loader, train_wts, _ = _load_data_from_ids(
+            train_ids,
+            val_ids,
+            labels_map,
             batch_size=config["batch_size"],
             num_workers=config["num_workers"],
             target_slices=config["target_slices"],
             image_size=config["image_size"],
+            data_dir=data_dir,
         )
     else:
-        train_loader, val_loader, train_wts, val_wts = loaders
+        train_loader, val_loader, train_wts, _ = loaders
 
     print("Initializing Model...")
     model = _build_model(model_name)
@@ -385,11 +516,10 @@ def train(
     if device == "cuda":
         model = model.cuda()
         train_wts = train_wts.cuda()
-        val_wts = val_wts.cuda()
 
     print("Initializing Loss Method...")
     criterion = torch.nn.BCEWithLogitsLoss(pos_weight=train_wts)
-    val_criterion = torch.nn.BCEWithLogitsLoss(pos_weight=val_wts)
+    val_criterion = torch.nn.BCEWithLogitsLoss(pos_weight=train_wts)
     if device == "cuda":
         criterion = criterion.cuda()
         val_criterion = val_criterion.cuda()
@@ -416,7 +546,7 @@ def train(
         best_val_auc = checkpoint.get("best_val_auc", best_val_auc)
         print(f"Resuming from epoch {starting_epoch} | Best AUC {best_val_auc:.4f}")
 
-    writer = SummaryWriter(comment=f"model={model_name} lr={config['lr']} task={config['task']} fold={fold_idx}")
+    writer = SummaryWriter(comment=f"model={model_name} lr={config['lr']} task={task_name} fold={fold_idx}")
     t_start_training = time.time()
 
     header = [
@@ -427,7 +557,7 @@ def train(
         "val_loss",
         "val_auc",
         "val_acc",
-        "best_threshold",
+        "best_thresholds",
         "lr",
     ]
 
@@ -466,9 +596,10 @@ def train(
 
         t_end = time.time()
         delta = t_end - epoch_start_time
+        thresh_str = ",".join([f"{t:.4f}" for t in best_thresh]) if isinstance(best_thresh, list) else f"{best_thresh:.4f}"
         print(
             "Epoch [{}/{}] | train loss {:.4f} | train auc {:.4f} | train acc {:.4f} | "
-            "val loss {:.4f} | val auc {:.4f} | val acc {:.4f} | thr {:.4f} | time {:.2f} s".format(
+            "val loss {:.4f} | val auc {:.4f} | val acc {:.4f} | thr [{}] | time {:.2f} s".format(
                 epoch,
                 num_epochs,
                 train_loss,
@@ -477,7 +608,7 @@ def train(
                 val_loss,
                 val_auc,
                 val_acc,
-                best_thresh,
+                thresh_str,
                 delta,
             )
         )
@@ -486,7 +617,7 @@ def train(
 
         _append_csv(
             csv_path,
-            [epoch, train_loss, train_auc, train_acc, val_loss, val_auc, val_acc, best_thresh, current_lr],
+            [epoch, train_loss, train_auc, train_acc, val_loss, val_auc, val_acc, thresh_str, current_lr],
             header,
         )
 
@@ -548,24 +679,24 @@ def train(
         auto_threshold=True,
     )
 
-    _plot_curves(csv_path, os.path.join(eval_folder, f"{model_name}_{config['task']}_curves.png"))
-    _plot_confusion_matrix(y_true, y_pred, os.path.join(eval_folder, f"{model_name}_{config['task']}_confusion.png"))
-    _plot_roc(y_true, y_prob, os.path.join(eval_folder, f"{model_name}_{config['task']}_roc.png"))
+    _plot_curves(csv_path, os.path.join(eval_folder, f"{model_name}_{task_name}_curves.png"))
+    _plot_confusion_matrix_multi(y_true, y_pred, class_names, eval_folder, f"{model_name}_{task_name}")
+    _plot_roc_multi(y_true, y_prob, class_names, os.path.join(eval_folder, f"{model_name}_{task_name}_roc.png"))
 
-    metrics_summary = _compute_confusion_metrics(y_true, y_pred)
-    metrics_summary["best_threshold"] = float(best_thresh)
-    summary_path = os.path.join(eval_folder, f"{model_name}_{config['task']}_summary.txt")
+    metrics_summary = _compute_confusion_metrics_multi(y_true, y_pred, class_names)
+    metrics_summary["best_thresholds"] = best_thresh
+    summary_path = os.path.join(eval_folder, f"{model_name}_{task_name}_summary.txt")
     with open(summary_path, "w", encoding="utf-8") as f:
         for k, v in metrics_summary.items():
             f.write(f"{k}: {v}\n")
 
     print(
-        "Summary | Acc {:.4f} | Sens {:.4f} | Spec {:.4f} | Prec {:.4f} | F1 {:.4f}".format(
-            metrics_summary["accuracy"],
-            metrics_summary["sensitivity"],
-            metrics_summary["specificity"],
-            metrics_summary["precision"],
-            metrics_summary["f1"],
+        "Summary | Macro Acc {:.4f} | Macro Sens {:.4f} | Macro Spec {:.4f} | Macro Prec {:.4f} | Macro F1 {:.4f}".format(
+            metrics_summary["macro"]["accuracy"],
+            metrics_summary["macro"]["sensitivity"],
+            metrics_summary["macro"]["specificity"],
+            metrics_summary["macro"]["precision"],
+            metrics_summary["macro"]["f1"],
         )
     )
 
@@ -573,8 +704,9 @@ def train(
     print(f"Plots saved to: {eval_folder}")
     print(f"Summary saved to: {summary_path}")
 
+    val_best_thresh = best_thresh
     if run_test:
-        test_ids, test_map = _read_split_labels(labels_dir, config["task"], "test")
+        test_ids, test_map = _read_split_labels_multilabel(labels_dir, class_names, "test")
         if test_ids:
             test_loader = _load_test_from_ids(
                 test_ids,
@@ -592,18 +724,18 @@ def train(
                 optimizer=None,
                 device=device,
                 phase="test",
-                threshold=threshold,
-                auto_threshold=True,
+                threshold=val_best_thresh,
+                auto_threshold=False,
             )
-            _plot_confusion_matrix(
-                y_true_t, y_pred_t, os.path.join(eval_folder, f"{model_name}_{config['task']}_test_confusion.png")
+            _plot_confusion_matrix_multi(
+                y_true_t, y_pred_t, class_names, eval_folder, f"{model_name}_{task_name}_test"
             )
-            _plot_roc(
-                y_true_t, y_prob_t, os.path.join(eval_folder, f"{model_name}_{config['task']}_test_roc.png")
+            _plot_roc_multi(
+                y_true_t, y_prob_t, class_names, os.path.join(eval_folder, f"{model_name}_{task_name}_test_roc.png")
             )
-            test_summary = _compute_confusion_metrics(y_true_t, y_pred_t)
-            test_summary["best_threshold"] = float(best_thresh_t)
-            test_path = os.path.join(eval_folder, f"{model_name}_{config['task']}_test_summary.txt")
+            test_summary = _compute_confusion_metrics_multi(y_true_t, y_pred_t, class_names)
+            test_summary["best_thresholds"] = best_thresh_t
+            test_path = os.path.join(eval_folder, f"{model_name}_{task_name}_test_summary.txt")
             with open(test_path, "w", encoding="utf-8") as f:
                 for k, v in test_summary.items():
                     f.write(f"{k}: {v}\n")
@@ -619,12 +751,6 @@ if __name__ == "__main__":
         choices=["densenet121", "efficientnetb0"],
         help="Choose model to train",
     )
-    parser.add_argument(
-        "--tasks",
-        type=str,
-        default="",
-        help="Comma-separated tasks to train (default: task in config.py)",
-    )
     parser.add_argument("--kfold", type=int, default=4, help="Enable K-Fold if > 1 (default: 4)")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for K-Fold split")
     parser.add_argument("--labels-dir", type=str, default="labels", help="Path to labels directory")
@@ -632,50 +758,56 @@ if __name__ == "__main__":
     parser.add_argument("--threshold", type=float, default=0.5, help="Threshold for converting prob to class")
     args = parser.parse_args()
 
-    tasks = [t.strip() for t in args.tasks.split(",") if t.strip()]
-    if not tasks:
-        tasks = [base_config["task"]]
-    for task in tasks:
-        cfg = dict(base_config)
-        cfg["task"] = task
-        print("Training Configuration")
-        print(cfg)
-        if args.kfold and args.kfold > 1:
-            ids, labels_map = _read_task_labels(args.labels_dir, task)
-            y = [labels_map[i] for i in ids]
-            skf = StratifiedKFold(n_splits=args.kfold, shuffle=True, random_state=args.seed)
-            fold_aucs = []
-            for fold_idx, (train_idx, val_idx) in enumerate(skf.split(ids, y)):
-                ids_train = [ids[i] for i in train_idx]
-                ids_val = [ids[i] for i in val_idx]
-                loaders = _load_data_from_ids(
-                    ids_train,
-                    ids_val,
-                    labels_map,
-                    batch_size=cfg["batch_size"],
-                    num_workers=cfg["num_workers"],
-                    target_slices=cfg["target_slices"],
-                    image_size=cfg["image_size"],
-                    data_dir=args.data_dir,
-                )
-                print(f"=== Task {task} | Fold {fold_idx + 1}/{args.kfold} ===")
-                train(
-                    config=cfg,
-                    model_name=args.model,
-                    loaders=loaders,
-                    fold_idx=fold_idx,
-                    resume=False,
-                    threshold=args.threshold,
-                )
-                # Read best AUC from checkpoint after fold
-                best_path = os.path.join("weights", task, f"fold_{fold_idx}", f"{args.model}_best_model.pth")
-                if os.path.exists(best_path):
-                    checkpoint = torch.load(best_path, map_location="cpu")
-                    fold_aucs.append(float(checkpoint.get("best_val_auc", 0.0)))
-            if fold_aucs:
-                mean_auc = float(np.mean(fold_aucs))
-                std_auc = float(np.std(fold_aucs))
-                print(f"K-Fold Summary | Task {task} | AUC {mean_auc:.4f} ± {std_auc:.4f}")
-        else:
-            train(config=cfg, model_name=args.model, threshold=args.threshold)
+    cfg = dict(base_config)
+    class_names = cfg.get("tasks", ["abnormal", "acl", "meniscus"])
+    task_name = cfg.get("task_name", "multilabel")
+    print("Training Configuration")
+    print(cfg)
+    if args.kfold and args.kfold > 1:
+        train_ids, train_map = _read_split_labels_multilabel(args.labels_dir, class_names, "train")
+        val_ids, val_map = _read_split_labels_multilabel(args.labels_dir, class_names, "valid")
+        ids = sorted(set(train_ids + val_ids))
+        labels_map = {**train_map, **val_map}
+        y_code = []
+        for rid in ids:
+            lab = labels_map[rid]
+            code = 0
+            for v in lab:
+                code = code * 2 + int(v)
+            y_code.append(code)
+        skf = StratifiedKFold(n_splits=args.kfold, shuffle=True, random_state=args.seed)
+        for fold_idx, (train_idx, val_idx) in enumerate(skf.split(ids, y_code)):
+            ids_train = [ids[i] for i in train_idx]
+            ids_val = [ids[i] for i in val_idx]
+            loaders = _load_data_from_ids(
+                ids_train,
+                ids_val,
+                labels_map,
+                batch_size=cfg["batch_size"],
+                num_workers=cfg["num_workers"],
+                target_slices=cfg["target_slices"],
+                image_size=cfg["image_size"],
+                data_dir=args.data_dir,
+            )
+            print(f"=== Task {task_name} | Fold {fold_idx + 1}/{args.kfold} ===")
+            train(
+                config=cfg,
+                model_name=args.model,
+                loaders=loaders,
+                fold_idx=fold_idx,
+                resume=False,
+                threshold=args.threshold,
+                labels_dir=args.labels_dir,
+                data_dir=args.data_dir,
+                run_test=True,
+            )
+    else:
+        train(
+            config=cfg,
+            model_name=args.model,
+            threshold=args.threshold,
+            labels_dir=args.labels_dir,
+            data_dir=args.data_dir,
+            run_test=True,
+        )
     print("Training Ended...")

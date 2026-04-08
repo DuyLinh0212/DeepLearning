@@ -24,7 +24,12 @@ def train(config : dict):
     """
     
     # 1. SETUP THƯ MỤC LƯU WEIGHTS
-    save_folder = './weights/{}'.format(config['task'])
+    task = config.get('task')
+    if not task:
+        tasks = config.get('tasks', ['abnormal', 'acl', 'meniscus'])
+        task = tasks[0]
+        print(f"[WARN] config.task not found. Using first task: {task}")
+    save_folder = './weights/{}'.format(task)
     if not os.path.exists(save_folder):
         os.makedirs(save_folder)
         print(f"Directory {save_folder} created!")
@@ -35,7 +40,7 @@ def train(config : dict):
 
     print('Starting to Train Model...')
     train_loader, val_loader, train_wts, val_wts = load_data(
-        config['task'],
+        task,
         batch_size=config['batch_size'],
         num_workers=config['num_workers'],
         target_slices=config['target_slices'],
@@ -90,7 +95,7 @@ def train(config : dict):
 
     print('Starting Training')
 
-    writer = SummaryWriter(comment='lr={} task={}'.format(config['lr'], config['task']))
+    writer = SummaryWriter(comment='lr={} task={}'.format(config['lr'], task))
     t_start_training = time.time()
 
     # Vòng lặp chính
