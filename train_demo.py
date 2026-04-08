@@ -114,17 +114,28 @@ def _find_source_split(data_dir, rid_str):
     return None
 
 
+def _read_split_labels(labels_dir, task, split):
+    path = os.path.join(labels_dir, f"{split}-{task}.csv")
+    data = np.genfromtxt(path, delimiter=",", dtype=int)
+    if data.ndim == 1 and data.size == 2:
+        data = np.array([data])
+    ids = []
+    labels_map = {}
+    for rid, lab in data:
+        rid = int(rid)
+        labels_map[rid] = int(lab)
+        ids.append(rid)
+    return ids, labels_map
+
+
 def _read_task_labels(labels_dir, task):
     labels_map = {}
+    all_ids = []
     for split in ["train", "valid", "test"]:
-        path = os.path.join(labels_dir, f"{split}-{task}.csv")
-        data = np.genfromtxt(path, delimiter=",", dtype=int)
-        if data.ndim == 1 and data.size == 2:
-            data = np.array([data])
-        for rid, lab in data:
-            labels_map[int(rid)] = int(lab)
-    ids = sorted(labels_map.keys())
-    return ids, labels_map
+        ids, split_map = _read_split_labels(labels_dir, task, split)
+        all_ids.extend(ids)
+        labels_map.update(split_map)
+    return sorted(all_ids), labels_map
 
 
 def _load_data_from_ids(ids_train, ids_val, labels_map, batch_size, num_workers, target_slices, image_size, data_dir):
@@ -157,6 +168,20 @@ def _load_data_from_ids(ids_train, ids_val, labels_map, batch_size, num_workers,
     )
     val_loader = DataLoader(val_data, batch_size=batch_size, num_workers=num_workers, shuffle=False)
     return train_loader, val_loader, train_data.weights, val_data.weights
+
+
+def _load_test_from_ids(ids_test, labels_map, batch_size, num_workers, target_slices, image_size, data_dir):
+    test_data = MRDataByIds(
+        ids_test,
+        labels_map,
+        data_dir=data_dir,
+        train=False,
+        transform=None,
+        target_slices=target_slices,
+        input_dim=image_size,
+    )
+    test_loader = DataLoader(test_data, batch_size=batch_size, num_workers=num_workers, shuffle=False)
+    return test_loader
 
 
 def _best_threshold(y_true, y_prob):
@@ -316,7 +341,17 @@ def _compute_confusion_metrics(y_true, y_pred):
     }
 
 
-def train(config: dict, model_name: str, loaders=None, fold_idx=None, resume=True, threshold=0.5):
+def train(
+    config: dict,
+    model_name: str,
+    loaders=None,
+    fold_idx=None,
+    resume=True,
+    threshold=0.5,
+    labels_dir="labels",
+    data_dir="data",
+    run_test=True,
+):
     fold_suffix = f"fold_{fold_idx}" if fold_idx is not None else None
     save_folder = os.path.join("weights", config["task"])
     if fold_suffix:
@@ -537,6 +572,42 @@ def train(config: dict, model_name: str, loaders=None, fold_idx=None, resume=Tru
     print(f"Metrics saved to: {csv_path}")
     print(f"Plots saved to: {eval_folder}")
     print(f"Summary saved to: {summary_path}")
+
+    if run_test:
+        test_ids, test_map = _read_split_labels(labels_dir, config["task"], "test")
+        if test_ids:
+            test_loader = _load_test_from_ids(
+                test_ids,
+                test_map,
+                batch_size=config["batch_size"],
+                num_workers=config["num_workers"],
+                target_slices=config["target_slices"],
+                image_size=config["image_size"],
+                data_dir=data_dir,
+            )
+            _, _, _, y_true_t, y_prob_t, y_pred_t, best_thresh_t = _run_epoch(
+                model,
+                test_loader,
+                val_criterion,
+                optimizer=None,
+                device=device,
+                phase="test",
+                threshold=threshold,
+                auto_threshold=True,
+            )
+            _plot_confusion_matrix(
+                y_true_t, y_pred_t, os.path.join(eval_folder, f"{model_name}_{config['task']}_test_confusion.png")
+            )
+            _plot_roc(
+                y_true_t, y_prob_t, os.path.join(eval_folder, f"{model_name}_{config['task']}_test_roc.png")
+            )
+            test_summary = _compute_confusion_metrics(y_true_t, y_pred_t)
+            test_summary["best_threshold"] = float(best_thresh_t)
+            test_path = os.path.join(eval_folder, f"{model_name}_{config['task']}_test_summary.txt")
+            with open(test_path, "w", encoding="utf-8") as f:
+                for k, v in test_summary.items():
+                    f.write(f"{k}: {v}\n")
+            print(f"Test summary saved to: {test_path}")
 
 
 if __name__ == "__main__":
