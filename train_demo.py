@@ -241,6 +241,7 @@ def _run_epoch(
     scaler=None,
     scheduler=None,
     use_amp=False,
+    xm=None,
 ):
     is_train = optimizer is not None
     model.train() if is_train else model.eval()
@@ -272,14 +273,20 @@ def _run_epoch(
                     loss = criterion(output, label)
                 if is_train:
                     scaler.scale(loss).backward()
-                    scaler.step(optimizer)
+                    if xm is not None:
+                        xm.optimizer_step(optimizer, barrier=True)
+                    else:
+                        scaler.step(optimizer)
                     scaler.update()
             else:
                 output = model(images)
                 loss = criterion(output, label)
                 if is_train:
                     loss.backward()
-                    optimizer.step()
+                    if xm is not None:
+                        xm.optimizer_step(optimizer, barrier=True)
+                    else:
+                        optimizer.step()
             if is_train and scheduler is not None:
                 scheduler.step()
 
@@ -551,6 +558,7 @@ def train(
     labels_dir="labels",
     data_dir="data",
     run_test=True,
+    device_arg="auto",
 ):
     task_name = config.get("task_name", "multilabel")
     class_names = config.get("tasks", ["abnormal", "acl", "meniscus"])
@@ -589,10 +597,27 @@ def train(
 
     print("Initializing Model...")
     model = _build_model(model_name)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    if device == "cuda":
-        model = model.cuda()
-        train_wts = train_wts.cuda()
+    xm = None
+    if device_arg == "tpu":
+        try:
+            import torch_xla.core.xla_model as xm  # type: ignore
+            import torch_xla.distributed.parallel_loader as pl  # type: ignore
+        except Exception as e:
+            raise RuntimeError("TPU selected but torch_xla is not available.") from e
+        device = xm.xla_device()
+    elif device_arg == "cuda":
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    else:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    if device != "cpu":
+        model = model.to(device)
+        train_wts = train_wts.to(device)
+
+    use_dataparallel = False
+    if device == "cuda" and torch.cuda.device_count() > 1 and device_arg in ["auto", "cuda"]:
+        model = torch.nn.DataParallel(model)
+        use_dataparallel = True
 
     print("Initializing Loss Method...")
     criterion = torch.nn.BCEWithLogitsLoss(pos_weight=train_wts)
@@ -602,6 +627,10 @@ def train(
         val_criterion = val_criterion.cuda()
 
     scaler = GradScaler(enabled=(device == "cuda"))
+
+    if xm is not None:
+        train_loader = pl.MpDeviceLoader(train_loader, device)
+        val_loader = pl.MpDeviceLoader(val_loader, device)
 
     starting_epoch = config["starting_epoch"]
     num_epochs = config["max_epoch"]
@@ -658,7 +687,8 @@ def train(
                 threshold=threshold,
                 scaler=scaler,
                 scheduler=scheduler,
-                use_amp=True,
+                use_amp=(device == "cuda"),
+                xm=xm,
             )
             val_loss, val_auc, val_acc, _, _, _, best_thresh = _run_epoch(
                 model,
@@ -670,7 +700,8 @@ def train(
                 threshold=threshold,
                 auto_threshold=True,
                 scaler=scaler,
-                use_amp=True,
+                use_amp=(device == "cuda"),
+                xm=xm,
             )
 
         writer.add_scalar("Train/Avg Loss", train_loss, epoch)
@@ -712,30 +743,34 @@ def train(
                 best_val_auc = val_auc
                 epochs_no_improve = 0
                 print(f"*** New Best AUC: {best_val_auc:.4f}. Saving best model for {model_name}...")
+                if xm is None or xm.is_master_ordinal():
+                    state_dict = model.module.state_dict() if use_dataparallel else model.state_dict()
+                    torch.save(
+                        {
+                            "model_state_dict": state_dict,
+                            "optimizer_state_dict": optimizer.state_dict(),
+                            "epoch": epoch,
+                            "best_val_auc": best_val_auc,
+                            "model_name": model_name,
+                            "stage": stage["name"],
+                        },
+                        best_model_path,
+                    )
+
+            if xm is None or xm.is_master_ordinal():
+                state_dict = model.module.state_dict() if use_dataparallel else model.state_dict()
                 torch.save(
                     {
-                        "model_state_dict": model.state_dict(),
+                        "model_state_dict": state_dict,
                         "optimizer_state_dict": optimizer.state_dict(),
                         "epoch": epoch,
                         "best_val_auc": best_val_auc,
                         "model_name": model_name,
                         "stage": stage["name"],
                     },
-                    best_model_path,
+                    last_model_path,
                 )
-
-            torch.save(
-                {
-                    "model_state_dict": model.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "epoch": epoch,
-                    "best_val_auc": best_val_auc,
-                    "model_name": model_name,
-                    "stage": stage["name"],
-                },
-                last_model_path,
-            )
-            print(f"Checkpoint saved to {last_model_path}")
+                print(f"Checkpoint saved to {last_model_path}")
 
             if not improved:
                 epochs_no_improve += 1
@@ -753,7 +788,10 @@ def train(
     # Load best model for final evaluation/plots
     if os.path.exists(best_model_path):
         checkpoint = torch.load(best_model_path, map_location=device)
-        model.load_state_dict(checkpoint["model_state_dict"])
+        if use_dataparallel:
+            model.module.load_state_dict(checkpoint["model_state_dict"])
+        else:
+            model.load_state_dict(checkpoint["model_state_dict"])
 
     model.eval()
     _, _, _, y_true, y_prob, y_pred, best_thresh = _run_epoch(
@@ -767,16 +805,18 @@ def train(
         auto_threshold=True,
     )
 
-    _plot_curves(csv_path, os.path.join(eval_folder, f"{model_name}_{task_name}_curves.png"))
-    _plot_confusion_matrix_multi(y_true, y_pred, class_names, eval_folder, f"{model_name}_{task_name}")
-    _plot_roc_multi(y_true, y_prob, class_names, os.path.join(eval_folder, f"{model_name}_{task_name}_roc.png"))
+    if xm is None or xm.is_master_ordinal():
+        _plot_curves(csv_path, os.path.join(eval_folder, f"{model_name}_{task_name}_curves.png"))
+        _plot_confusion_matrix_multi(y_true, y_pred, class_names, eval_folder, f"{model_name}_{task_name}")
+        _plot_roc_multi(y_true, y_prob, class_names, os.path.join(eval_folder, f"{model_name}_{task_name}_roc.png"))
 
     metrics_summary = _compute_confusion_metrics_multi(y_true, y_pred, class_names)
     metrics_summary["best_thresholds"] = best_thresh
     summary_path = os.path.join(eval_folder, f"{model_name}_{task_name}_summary.txt")
-    with open(summary_path, "w", encoding="utf-8") as f:
-        for k, v in metrics_summary.items():
-            f.write(f"{k}: {v}\n")
+    if xm is None or xm.is_master_ordinal():
+        with open(summary_path, "w", encoding="utf-8") as f:
+            for k, v in metrics_summary.items():
+                f.write(f"{k}: {v}\n")
 
     print(
         "Summary | Macro Acc {:.4f} | Macro Sens {:.4f} | Macro Spec {:.4f} | Macro Prec {:.4f} | Macro F1 {:.4f}".format(
@@ -788,9 +828,10 @@ def train(
         )
     )
 
-    print(f"Metrics saved to: {csv_path}")
-    print(f"Plots saved to: {eval_folder}")
-    print(f"Summary saved to: {summary_path}")
+    if xm is None or xm.is_master_ordinal():
+        print(f"Metrics saved to: {csv_path}")
+        print(f"Plots saved to: {eval_folder}")
+        print(f"Summary saved to: {summary_path}")
 
     val_best_thresh = best_thresh
     if run_test:
@@ -805,6 +846,8 @@ def train(
                 image_size=config["image_size"],
                 data_dir=data_dir,
             )
+            if xm is not None:
+                test_loader = pl.MpDeviceLoader(test_loader, device)
             _, _, _, y_true_t, y_prob_t, y_pred_t, best_thresh_t = _run_epoch(
                 model,
                 test_loader,
@@ -814,20 +857,22 @@ def train(
                 phase="test",
                 threshold=val_best_thresh,
                 auto_threshold=False,
+                xm=xm,
             )
-            _plot_confusion_matrix_multi(
-                y_true_t, y_pred_t, class_names, eval_folder, f"{model_name}_{task_name}_test"
-            )
-            _plot_roc_multi(
-                y_true_t, y_prob_t, class_names, os.path.join(eval_folder, f"{model_name}_{task_name}_test_roc.png")
-            )
-            test_summary = _compute_confusion_metrics_multi(y_true_t, y_pred_t, class_names)
-            test_summary["best_thresholds"] = best_thresh_t
-            test_path = os.path.join(eval_folder, f"{model_name}_{task_name}_test_summary.txt")
-            with open(test_path, "w", encoding="utf-8") as f:
-                for k, v in test_summary.items():
-                    f.write(f"{k}: {v}\n")
-            print(f"Test summary saved to: {test_path}")
+            if xm is None or xm.is_master_ordinal():
+                _plot_confusion_matrix_multi(
+                    y_true_t, y_pred_t, class_names, eval_folder, f"{model_name}_{task_name}_test"
+                )
+                _plot_roc_multi(
+                    y_true_t, y_prob_t, class_names, os.path.join(eval_folder, f"{model_name}_{task_name}_test_roc.png")
+                )
+                test_summary = _compute_confusion_metrics_multi(y_true_t, y_pred_t, class_names)
+                test_summary["best_thresholds"] = best_thresh_t
+                test_path = os.path.join(eval_folder, f"{model_name}_{task_name}_test_summary.txt")
+                with open(test_path, "w", encoding="utf-8") as f:
+                    for k, v in test_summary.items():
+                        f.write(f"{k}: {v}\n")
+                print(f"Test summary saved to: {test_path}")
 
 
 if __name__ == "__main__":
@@ -844,6 +889,13 @@ if __name__ == "__main__":
     parser.add_argument("--labels-dir", type=str, default="labels", help="Path to labels directory")
     parser.add_argument("--data-dir", type=str, default="data", help="Path to data directory")
     parser.add_argument("--threshold", type=float, default=0.5, help="Threshold for converting prob to class")
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="auto",
+        choices=["auto", "cpu", "cuda", "tpu"],
+        help="Device to use: auto/cpu/cuda/tpu",
+    )
     args = parser.parse_args()
 
     cfg = dict(base_config)
@@ -888,6 +940,7 @@ if __name__ == "__main__":
                 labels_dir=args.labels_dir,
                 data_dir=args.data_dir,
                 run_test=True,
+                device_arg=args.device,
             )
     else:
         train(
@@ -897,5 +950,6 @@ if __name__ == "__main__":
             labels_dir=args.labels_dir,
             data_dir=args.data_dir,
             run_test=True,
+            device_arg=args.device,
         )
     print("Training Ended...")
