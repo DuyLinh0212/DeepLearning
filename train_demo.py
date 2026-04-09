@@ -5,6 +5,7 @@ import time
 
 import numpy as np
 import torch
+from torch.cuda.amp import autocast, GradScaler
 from sklearn import metrics
 from sklearn.model_selection import StratifiedKFold
 from torch.utils.tensorboard import SummaryWriter
@@ -228,7 +229,19 @@ def _best_thresholds(y_true, y_prob):
     return thresholds
 
 
-def _run_epoch(model, loader, criterion, optimizer=None, device="cpu", phase="train", threshold=0.5, auto_threshold=False):
+def _run_epoch(
+    model,
+    loader,
+    criterion,
+    optimizer=None,
+    device="cpu",
+    phase="train",
+    threshold=0.5,
+    auto_threshold=False,
+    scaler=None,
+    scheduler=None,
+    use_amp=False,
+):
     is_train = optimizer is not None
     model.train() if is_train else model.eval()
 
@@ -253,11 +266,22 @@ def _run_epoch(model, loader, criterion, optimizer=None, device="cpu", phase="tr
             optimizer.zero_grad()
 
         with torch.set_grad_enabled(is_train):
-            output = model(images)
-            loss = criterion(output, label)
-            if is_train:
-                loss.backward()
-                optimizer.step()
+            if use_amp and device != "cpu":
+                with autocast():
+                    output = model(images)
+                    loss = criterion(output, label)
+                if is_train:
+                    scaler.scale(loss).backward()
+                    scaler.step(optimizer)
+                    scaler.update()
+            else:
+                output = model(images)
+                loss = criterion(output, label)
+                if is_train:
+                    loss.backward()
+                    optimizer.step()
+            if is_train and scheduler is not None:
+                scheduler.step()
 
         losses.append(loss.item())
 
@@ -478,6 +502,45 @@ def _compute_confusion_metrics_multi(y_true, y_pred, class_names):
     return summary
 
 
+def _set_trainable(model, train_backbone: bool):
+    # Freeze everything first
+    for p in model.parameters():
+        p.requires_grad = False
+
+    # Unfreeze head layers
+    for name, module in model.named_modules():
+        if name.endswith("fc") or name.endswith("attn"):
+            for p in module.parameters():
+                p.requires_grad = True
+
+    # Unfreeze backbone if requested
+    if train_backbone:
+        if hasattr(model, "backbone"):
+            for p in model.backbone.parameters():
+                p.requires_grad = True
+        else:
+            for attr in ["axial", "coronal", "sagittal"]:
+                if hasattr(model, attr):
+                    for p in getattr(model, attr).parameters():
+                        p.requires_grad = True
+
+
+def _build_optimizer(model, lr, weight_decay):
+    params = [p for p in model.parameters() if p.requires_grad]
+    return torch.optim.Adam(params, lr=lr, weight_decay=weight_decay)
+
+
+def _build_onecycle(optimizer, max_lr, epochs, steps_per_epoch):
+    return torch.optim.lr_scheduler.OneCycleLR(
+        optimizer,
+        max_lr=max_lr,
+        epochs=epochs,
+        steps_per_epoch=steps_per_epoch,
+        pct_start=0.3,
+        anneal_strategy="cos",
+    )
+
+
 def train(
     config: dict,
     model_name: str,
@@ -538,24 +601,16 @@ def train(
         criterion = criterion.cuda()
         val_criterion = val_criterion.cuda()
 
-    print("Setup the Optimizer")
-    optimizer = torch.optim.Adam(model.parameters(), lr=config["lr"], weight_decay=config["weight_decay"])
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, patience=3, factor=0.3, threshold=1e-4
-    )
+    scaler = GradScaler(enabled=(device == "cuda"))
 
     starting_epoch = config["starting_epoch"]
     num_epochs = config["max_epoch"]
     best_val_auc = float(0)
-    patience = config.get("patience", 5)
-    epochs_no_improve = 0
 
     if resume and os.path.exists(last_model_path):
         print(f"Found checkpoint at {last_model_path}. Loading...")
         checkpoint = torch.load(last_model_path, map_location=device)
         model.load_state_dict(checkpoint["model_state_dict"])
-        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-        scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
         starting_epoch = checkpoint.get("epoch", starting_epoch) + 1
         best_val_auc = checkpoint.get("best_val_auc", best_val_auc)
         print(f"Resuming from epoch {starting_epoch} | Best AUC {best_val_auc:.4f}")
@@ -575,29 +630,48 @@ def train(
         "lr",
     ]
 
-    for epoch in range(starting_epoch, num_epochs):
-        current_lr = _get_lr(optimizer)
-        epoch_start_time = time.time()
+    stages = [
+        {"name": "head", "train_backbone": False, "patience": 5, "max_lr": config["lr"]},
+        {"name": "unfreeze", "train_backbone": True, "patience": 5, "max_lr": config["lr"]},
+        {"name": "finetune", "train_backbone": True, "patience": 10, "max_lr": config["lr"]},
+    ]
 
-        train_loss, train_auc, train_acc, _, _, _, _ = _run_epoch(
-            model,
-            train_loader,
-            criterion,
-            optimizer=optimizer,
-            device=device,
-            phase="train",
-            threshold=threshold,
-        )
-        val_loss, val_auc, val_acc, _, _, _, best_thresh = _run_epoch(
-            model,
-            val_loader,
-            val_criterion,
-            optimizer=None,
-            device=device,
-            phase="val",
-            threshold=threshold,
-            auto_threshold=True,
-        )
+    for stage_idx, stage in enumerate(stages):
+        print(f"=== Stage {stage_idx + 1}: {stage['name']} ===")
+        _set_trainable(model, stage["train_backbone"])
+        optimizer = _build_optimizer(model, stage["max_lr"], config["weight_decay"])
+        scheduler = _build_onecycle(optimizer, stage["max_lr"], num_epochs, len(train_loader))
+        patience = stage["patience"]
+        epochs_no_improve = 0
+
+        for epoch in range(starting_epoch, num_epochs):
+            current_lr = _get_lr(optimizer)
+            epoch_start_time = time.time()
+
+            train_loss, train_auc, train_acc, _, _, _, _ = _run_epoch(
+                model,
+                train_loader,
+                criterion,
+                optimizer=optimizer,
+                device=device,
+                phase="train",
+                threshold=threshold,
+                scaler=scaler,
+                scheduler=scheduler,
+                use_amp=True,
+            )
+            val_loss, val_auc, val_acc, _, _, _, best_thresh = _run_epoch(
+                model,
+                val_loader,
+                val_criterion,
+                optimizer=None,
+                device=device,
+                phase="val",
+                threshold=threshold,
+                auto_threshold=True,
+                scaler=scaler,
+                use_amp=True,
+            )
 
         writer.add_scalar("Train/Avg Loss", train_loss, epoch)
         writer.add_scalar("Train/AUC_epoch", train_auc, epoch)
@@ -606,10 +680,8 @@ def train(
         writer.add_scalar("Val/AUC_epoch", val_auc, epoch)
         writer.add_scalar("Val/Acc_epoch", val_acc, epoch)
 
-        scheduler.step(val_loss)
-
-        t_end = time.time()
-        delta = t_end - epoch_start_time
+            t_end = time.time()
+            delta = t_end - epoch_start_time
         thresh_str = ";".join([f"{t:.4f}" for t in best_thresh]) if isinstance(best_thresh, list) else f"{best_thresh:.4f}"
         print(
             "Epoch [{}/{}] | train loss {:.4f} | train auc {:.4f} | train acc {:.4f} | "
@@ -635,41 +707,43 @@ def train(
             header,
         )
 
-        improved = val_auc > best_val_auc
-        if improved:
-            best_val_auc = val_auc
-            epochs_no_improve = 0
-            print(f"*** New Best AUC: {best_val_auc:.4f}. Saving best model for {model_name}...")
+            improved = val_auc > best_val_auc
+            if improved:
+                best_val_auc = val_auc
+                epochs_no_improve = 0
+                print(f"*** New Best AUC: {best_val_auc:.4f}. Saving best model for {model_name}...")
+                torch.save(
+                    {
+                        "model_state_dict": model.state_dict(),
+                        "optimizer_state_dict": optimizer.state_dict(),
+                        "epoch": epoch,
+                        "best_val_auc": best_val_auc,
+                        "model_name": model_name,
+                        "stage": stage["name"],
+                    },
+                    best_model_path,
+                )
+
             torch.save(
                 {
                     "model_state_dict": model.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
-                    "scheduler_state_dict": scheduler.state_dict(),
                     "epoch": epoch,
                     "best_val_auc": best_val_auc,
                     "model_name": model_name,
+                    "stage": stage["name"],
                 },
-                best_model_path,
+                last_model_path,
             )
+            print(f"Checkpoint saved to {last_model_path}")
 
-        torch.save(
-            {
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "scheduler_state_dict": scheduler.state_dict(),
-                "epoch": epoch,
-                "best_val_auc": best_val_auc,
-                "model_name": model_name,
-            },
-            last_model_path,
-        )
-        print(f"Checkpoint saved to {last_model_path}")
+            if not improved:
+                epochs_no_improve += 1
+            if epochs_no_improve >= patience:
+                print(f"Early stopping: no improvement in {patience} epochs.")
+                break
 
-        if not improved:
-            epochs_no_improve += 1
-        if epochs_no_improve >= patience:
-            print(f"Early stopping: no improvement in {patience} epochs.")
-            break
+        starting_epoch = 0
 
     t_end_training = time.time()
     print(f"Training finished. Total time: {t_end_training - t_start_training:.2f} s")
