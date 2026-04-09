@@ -299,7 +299,8 @@ def _run_epoch(
         y_true.extend(labels.tolist())
 
     if len(losses) == 0:
-        return 0.0, 0.5, 0.0, [], [], []
+        thr = list(threshold) if isinstance(threshold, (list, tuple, np.ndarray)) else [threshold]
+        return 0.0, 0.5, 0.0, [], [], [], thr
 
     y_true = np.asarray(y_true)
     y_prob = np.asarray(y_prob)
@@ -704,39 +705,39 @@ def train(
                 xm=xm,
             )
 
-        writer.add_scalar("Train/Avg Loss", train_loss, epoch)
-        writer.add_scalar("Train/AUC_epoch", train_auc, epoch)
-        writer.add_scalar("Train/Acc_epoch", train_acc, epoch)
-        writer.add_scalar("Val/Avg Loss", val_loss, epoch)
-        writer.add_scalar("Val/AUC_epoch", val_auc, epoch)
-        writer.add_scalar("Val/Acc_epoch", val_acc, epoch)
+            writer.add_scalar("Train/Avg Loss", train_loss, epoch)
+            writer.add_scalar("Train/AUC_epoch", train_auc, epoch)
+            writer.add_scalar("Train/Acc_epoch", train_acc, epoch)
+            writer.add_scalar("Val/Avg Loss", val_loss, epoch)
+            writer.add_scalar("Val/AUC_epoch", val_auc, epoch)
+            writer.add_scalar("Val/Acc_epoch", val_acc, epoch)
 
             t_end = time.time()
             delta = t_end - epoch_start_time
-        thresh_str = ";".join([f"{t:.4f}" for t in best_thresh]) if isinstance(best_thresh, list) else f"{best_thresh:.4f}"
-        print(
-            "Epoch [{}/{}] | train loss {:.4f} | train auc {:.4f} | train acc {:.4f} | "
-            "val loss {:.4f} | val auc {:.4f} | val acc {:.4f} | thr [{}] | time {:.2f} s".format(
-                epoch,
-                num_epochs,
-                train_loss,
-                train_auc,
-                train_acc,
-                val_loss,
-                val_auc,
-                val_acc,
-                thresh_str,
-                delta,
+            thresh_str = ";".join([f"{t:.4f}" for t in best_thresh]) if isinstance(best_thresh, list) else f"{best_thresh:.4f}"
+            print(
+                "Epoch [{}/{}] | train loss {:.4f} | train auc {:.4f} | train acc {:.4f} | "
+                "val loss {:.4f} | val auc {:.4f} | val acc {:.4f} | thr [{}] | time {:.2f} s".format(
+                    epoch,
+                    num_epochs,
+                    train_loss,
+                    train_auc,
+                    train_acc,
+                    val_loss,
+                    val_auc,
+                    val_acc,
+                    thresh_str,
+                    delta,
+                )
             )
-        )
-        print("-" * 30)
-        writer.flush()
+            print("-" * 30)
+            writer.flush()
 
-        _append_csv(
-            csv_path,
-            [epoch, train_loss, train_auc, train_acc, val_loss, val_auc, val_acc, thresh_str, current_lr],
-            header,
-        )
+            _append_csv(
+                csv_path,
+                [epoch, train_loss, train_auc, train_acc, val_loss, val_auc, val_acc, thresh_str, current_lr],
+                header,
+            )
 
             improved = val_auc > best_val_auc
             if improved:
