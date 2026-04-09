@@ -608,7 +608,7 @@ def train(
 
     stages = [
         {"name": "head", "train_backbone": False, "patience": 5, "max_lr": config["lr"], "use_onecycle": False},
-        {"name": "unfreeze", "train_backbone": True, "patience": 5, "max_lr": config["lr"], "use_onecycle": True},
+        {"name": "unfreeze", "train_backbone": True, "patience": 10, "max_lr": config["lr"], "use_onecycle": True},
         {"name": "finetune", "train_backbone": True, "patience": 10, "max_lr": config["lr"], "use_onecycle": True},
     ]
 
