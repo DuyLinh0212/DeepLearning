@@ -318,14 +318,28 @@ def _append_csv(csv_path, row, header):
 
 
 def _plot_curves(csv_path, out_path):
-    data = np.genfromtxt(csv_path, delimiter=",", names=True, dtype=None, encoding="utf-8")
-    epochs = np.atleast_1d(data["epoch"])
-    train_loss = np.atleast_1d(data["train_loss"])
-    val_loss = np.atleast_1d(data["val_loss"])
-    train_auc = np.atleast_1d(data["train_auc"])
-    val_auc = np.atleast_1d(data["val_auc"])
-    train_acc = np.atleast_1d(data["train_acc"])
-    val_acc = np.atleast_1d(data["val_acc"])
+    epochs = []
+    train_loss = []
+    val_loss = []
+    train_auc = []
+    val_auc = []
+    train_acc = []
+    val_acc = []
+    with open(csv_path, "r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            try:
+                epochs.append(float(row["epoch"]))
+                train_loss.append(float(row["train_loss"]))
+                val_loss.append(float(row["val_loss"]))
+                train_auc.append(float(row["train_auc"]))
+                val_auc.append(float(row["val_auc"]))
+                train_acc.append(float(row["train_acc"]))
+                val_acc.append(float(row["val_acc"]))
+            except Exception:
+                continue
+    if len(epochs) == 0:
+        return
 
     plt.figure(figsize=(10, 6))
     plt.plot(epochs, train_loss, label="train_loss")
@@ -596,7 +610,7 @@ def train(
 
         t_end = time.time()
         delta = t_end - epoch_start_time
-        thresh_str = ",".join([f"{t:.4f}" for t in best_thresh]) if isinstance(best_thresh, list) else f"{best_thresh:.4f}"
+        thresh_str = ";".join([f"{t:.4f}" for t in best_thresh]) if isinstance(best_thresh, list) else f"{best_thresh:.4f}"
         print(
             "Epoch [{}/{}] | train loss {:.4f} | train auc {:.4f} | train acc {:.4f} | "
             "val loss {:.4f} | val auc {:.4f} | val acc {:.4f} | thr [{}] | time {:.2f} s".format(
