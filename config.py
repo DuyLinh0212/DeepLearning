@@ -5,8 +5,7 @@ config = {
     'starting_epoch' : 0,
     'batch_size' : 4,
     'log_val' : 10,
-    'tasks' : ['abnormal', 'acl', 'meniscus'],
-    'task_name' : 'multilabel',
+    'task' : 'acl', # "meniscus" and  "acl" are the other options
     'weight_decay' : 3e-4,
     'patience' : 5,
     'save_model' : 1,

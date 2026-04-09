@@ -25,7 +25,7 @@ class EfficientNetB0(nn.Module):
             nn.Linear(3 * 1280, 512),
             nn.ReLU(),
             nn.Dropout(0.5),
-            nn.Linear(512, 3),
+            nn.Linear(512, 1),
         )
 
     def _encode_plane(self, net, x):

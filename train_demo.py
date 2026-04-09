@@ -58,14 +58,10 @@ class MRDataByIds(Dataset):
             for plane in self.planes:
                 self.paths[plane].append(os.path.join(self.data_dir, src_split, plane, f"{rid_str}.npy"))
 
-        self.labels = [self.labels_map[rid] for rid in self.ids]
-        labels_arr = np.array(self.labels, dtype=np.float32)
-        if labels_arr.ndim == 1:
-            labels_arr = labels_arr.reshape(-1, 1)
-        pos = labels_arr.sum(axis=0)
-        neg = labels_arr.shape[0] - pos
-        pos_weight = np.where(pos > 0, neg / pos, 1.0)
-        self.weights = torch.FloatTensor(pos_weight)
+        self.labels = [int(self.labels_map[rid]) for rid in self.ids]
+        pos = sum(self.labels)
+        neg = len(self.labels) - pos
+        self.weights = torch.FloatTensor([neg / pos]) if pos > 0 else torch.FloatTensor([1.0])
 
     def __len__(self):
         return len(self.ids)
@@ -83,10 +79,7 @@ class MRDataByIds(Dataset):
             img_raw[plane] = self._resize_image(img_raw[plane])
 
         label = self.labels[index]
-        label_arr = np.array(label, dtype=np.float32)
-        if label_arr.ndim == 0:
-            label_arr = label_arr.reshape(1)
-        label = torch.from_numpy(label_arr)
+        label = torch.FloatTensor([1]) if label == 1 else torch.FloatTensor([0])
         return [img_raw[plane] for plane in self.planes], label
 
     def _resize_image(self, image):
@@ -120,47 +113,28 @@ def _find_source_split(data_dir, rid_str):
     return None
 
 
-def _read_split_labels_multilabel(labels_dir, tasks, split):
-    task_maps = []
-    for task in tasks:
-        path = os.path.join(labels_dir, f"{split}-{task}.csv")
-        data = np.genfromtxt(path, delimiter=",", dtype=int)
-        if data.ndim == 1 and data.size == 2:
-            data = np.array([data])
-        m = {}
-        for rid, lab in data:
-            m[int(rid)] = int(lab)
-        task_maps.append(m)
-
-    ids = set(task_maps[0].keys())
-    for m in task_maps[1:]:
-        ids = ids.intersection(m.keys())
-    ids = sorted(ids)
-
-    labels_map = {rid: [m[rid] for m in task_maps] for rid in ids}
+def _read_split_labels(labels_dir, task, split):
+    path = os.path.join(labels_dir, f"{split}-{task}.csv")
+    data = np.genfromtxt(path, delimiter=",", dtype=int)
+    if data.ndim == 1 and data.size == 2:
+        data = np.array([data])
+    ids = []
+    labels_map = {}
+    for rid, lab in data:
+        rid = int(rid)
+        labels_map[rid] = int(lab)
+        ids.append(rid)
     return ids, labels_map
 
 
-def _read_all_labels_multilabel(labels_dir, tasks):
-    task_maps = []
-    for task in tasks:
-        m = {}
-        for split in ["train", "valid", "test"]:
-            path = os.path.join(labels_dir, f"{split}-{task}.csv")
-            data = np.genfromtxt(path, delimiter=",", dtype=int)
-            if data.ndim == 1 and data.size == 2:
-                data = np.array([data])
-            for rid, lab in data:
-                m[int(rid)] = int(lab)
-        task_maps.append(m)
-
-    ids = set(task_maps[0].keys())
-    for m in task_maps[1:]:
-        ids = ids.intersection(m.keys())
-    ids = sorted(ids)
-
-    labels_map = {rid: [m[rid] for m in task_maps] for rid in ids}
-    return ids, labels_map
+def _read_task_labels(labels_dir, task):
+    labels_map = {}
+    all_ids = []
+    for split in ["train", "valid", "test"]:
+        ids, split_map = _read_split_labels(labels_dir, task, split)
+        all_ids.extend(ids)
+        labels_map.update(split_map)
+    return sorted(all_ids), labels_map
 
 
 def _load_data_from_ids(ids_train, ids_val, labels_map, batch_size, num_workers, target_slices, image_size, data_dir):
@@ -209,24 +183,15 @@ def _load_test_from_ids(ids_test, labels_map, batch_size, num_workers, target_sl
     return test_loader
 
 
-def _best_thresholds(y_true, y_prob):
-    y_true = np.asarray(y_true)
-    y_prob = np.asarray(y_prob)
-    if y_true.ndim == 1:
-        y_true = y_true.reshape(-1, 1)
-        y_prob = y_prob.reshape(-1, 1)
-    thresholds = []
-    for i in range(y_true.shape[1]):
-        try:
-            fpr, tpr, thr = metrics.roc_curve(y_true[:, i], y_prob[:, i])
-            if len(thr) == 0:
-                thresholds.append(0.5)
-                continue
-            idx = int(np.argmax(tpr - fpr))
-            thresholds.append(float(thr[idx]))
-        except Exception:
-            thresholds.append(0.5)
-    return thresholds
+def _best_threshold(y_true, y_prob):
+    try:
+        fpr, tpr, thr = metrics.roc_curve(y_true, y_prob)
+        if len(thr) == 0:
+            return 0.5
+        idx = int(np.argmax(tpr - fpr))
+        return float(thr[idx])
+    except Exception:
+        return 0.5
 
 
 def _run_epoch(
@@ -299,44 +264,23 @@ def _run_epoch(
         y_true.extend(labels.tolist())
 
     if len(losses) == 0:
-        thr = list(threshold) if isinstance(threshold, (list, tuple, np.ndarray)) else [threshold]
-        return 0.0, 0.5, 0.0, [], [], [], thr
+        return 0.0, 0.5, 0.0, [], [], [], float(threshold)
 
-    y_true = np.asarray(y_true)
-    y_prob = np.asarray(y_prob)
-    if y_true.ndim == 1:
-        y_true = y_true.reshape(-1, 1)
-        y_prob = y_prob.reshape(-1, 1)
+    y_true = np.asarray(y_true).reshape(-1)
+    y_prob = np.asarray(y_prob).reshape(-1)
 
-    aucs = []
-    for i in range(y_true.shape[1]):
-        try:
-            aucs.append(metrics.roc_auc_score(y_true[:, i], y_prob[:, i]))
-        except Exception:
-            aucs.append(0.5)
-    auc = float(np.mean(aucs)) if len(aucs) else 0.5
+    try:
+        auc = metrics.roc_auc_score(y_true, y_prob)
+    except Exception:
+        auc = 0.5
 
     if auto_threshold:
-        thresholds = _best_thresholds(y_true, y_prob)
-    else:
-        if isinstance(threshold, (list, tuple, np.ndarray)):
-            thresholds = list(threshold)
-        else:
-            thresholds = [threshold] * y_true.shape[1]
+        threshold = _best_threshold(y_true, y_prob)
 
-    y_pred = []
-    for row in y_prob:
-        y_pred.append([1 if row[i] >= thresholds[i] else 0 for i in range(len(thresholds))])
-    y_pred = np.asarray(y_pred)
-    accs = []
-    for i in range(y_true.shape[1]):
-        try:
-            accs.append(metrics.accuracy_score(y_true[:, i], y_pred[:, i]))
-        except Exception:
-            accs.append(0.0)
-    acc = float(np.mean(accs)) if len(accs) else 0.0
+    y_pred = [1 if p >= threshold else 0 for p in y_prob]
+    acc = metrics.accuracy_score(y_true, y_pred)
     loss_mean = float(np.mean(losses))
-    return loss_mean, float(auc), float(acc), y_true, y_prob, y_pred, thresholds
+    return loss_mean, float(auc), float(acc), y_true, y_prob, y_pred, float(threshold)
 
 
 def _append_csv(csv_path, row, header):
@@ -561,8 +505,7 @@ def train(
     run_test=True,
     device_arg="auto",
 ):
-    task_name = config.get("task_name", "multilabel")
-    class_names = config.get("tasks", ["abnormal", "acl", "meniscus"])
+    task_name = config.get("task", "acl")
     fold_suffix = f"fold_{fold_idx}" if fold_idx is not None else None
     save_folder = os.path.join("weights", task_name)
     if fold_suffix:
@@ -580,8 +523,8 @@ def train(
 
     print("Starting to Train Model...")
     if loaders is None:
-        train_ids, train_map = _read_split_labels_multilabel(labels_dir, class_names, "train")
-        val_ids, val_map = _read_split_labels_multilabel(labels_dir, class_names, "valid")
+        train_ids, train_map = _read_split_labels(labels_dir, task_name, "train")
+        val_ids, val_map = _read_split_labels(labels_dir, task_name, "valid")
         labels_map = {**train_map, **val_map}
         train_loader, val_loader, train_wts, _ = _load_data_from_ids(
             train_ids,
@@ -640,7 +583,10 @@ def train(
     if resume and os.path.exists(last_model_path):
         print(f"Found checkpoint at {last_model_path}. Loading...")
         checkpoint = torch.load(last_model_path, map_location=device)
-        model.load_state_dict(checkpoint["model_state_dict"])
+        if use_dataparallel:
+            model.module.load_state_dict(checkpoint["model_state_dict"])
+        else:
+            model.load_state_dict(checkpoint["model_state_dict"])
         starting_epoch = checkpoint.get("epoch", starting_epoch) + 1
         best_val_auc = checkpoint.get("best_val_auc", best_val_auc)
         print(f"Resuming from epoch {starting_epoch} | Best AUC {best_val_auc:.4f}")
@@ -656,21 +602,23 @@ def train(
         "val_loss",
         "val_auc",
         "val_acc",
-        "best_thresholds",
+        "best_threshold",
         "lr",
     ]
 
     stages = [
-        {"name": "head", "train_backbone": False, "patience": 5, "max_lr": config["lr"]},
-        {"name": "unfreeze", "train_backbone": True, "patience": 5, "max_lr": config["lr"]},
-        {"name": "finetune", "train_backbone": True, "patience": 10, "max_lr": config["lr"]},
+        {"name": "head", "train_backbone": False, "patience": 5, "max_lr": config["lr"], "use_onecycle": False},
+        {"name": "unfreeze", "train_backbone": True, "patience": 5, "max_lr": config["lr"], "use_onecycle": True},
+        {"name": "finetune", "train_backbone": True, "patience": 10, "max_lr": config["lr"], "use_onecycle": True},
     ]
 
     for stage_idx, stage in enumerate(stages):
         print(f"=== Stage {stage_idx + 1}: {stage['name']} ===")
         _set_trainable(model, stage["train_backbone"])
         optimizer = _build_optimizer(model, stage["max_lr"], config["weight_decay"])
-        scheduler = _build_onecycle(optimizer, stage["max_lr"], num_epochs, len(train_loader))
+        scheduler = None
+        if stage["use_onecycle"]:
+            scheduler = _build_onecycle(optimizer, stage["max_lr"], num_epochs, len(train_loader))
         patience = stage["patience"]
         epochs_no_improve = 0
 
@@ -714,7 +662,7 @@ def train(
 
             t_end = time.time()
             delta = t_end - epoch_start_time
-            thresh_str = ";".join([f"{t:.4f}" for t in best_thresh]) if isinstance(best_thresh, list) else f"{best_thresh:.4f}"
+            thresh_str = f"{best_thresh:.4f}"
             print(
                 "Epoch [{}/{}] | train loss {:.4f} | train auc {:.4f} | train acc {:.4f} | "
                 "val loss {:.4f} | val auc {:.4f} | val acc {:.4f} | thr [{}] | time {:.2f} s".format(
@@ -808,11 +756,11 @@ def train(
 
     if xm is None or xm.is_master_ordinal():
         _plot_curves(csv_path, os.path.join(eval_folder, f"{model_name}_{task_name}_curves.png"))
-        _plot_confusion_matrix_multi(y_true, y_pred, class_names, eval_folder, f"{model_name}_{task_name}")
-        _plot_roc_multi(y_true, y_prob, class_names, os.path.join(eval_folder, f"{model_name}_{task_name}_roc.png"))
+        _plot_confusion_matrix(y_true, y_pred, os.path.join(eval_folder, f"{model_name}_{task_name}_confusion.png"))
+        _plot_roc(y_true, y_prob, os.path.join(eval_folder, f"{model_name}_{task_name}_roc.png"))
 
-    metrics_summary = _compute_confusion_metrics_multi(y_true, y_pred, class_names)
-    metrics_summary["best_thresholds"] = best_thresh
+    metrics_summary = _compute_confusion_metrics(y_true, y_pred)
+    metrics_summary["best_threshold"] = float(best_thresh)
     summary_path = os.path.join(eval_folder, f"{model_name}_{task_name}_summary.txt")
     if xm is None or xm.is_master_ordinal():
         with open(summary_path, "w", encoding="utf-8") as f:
@@ -820,12 +768,12 @@ def train(
                 f.write(f"{k}: {v}\n")
 
     print(
-        "Summary | Macro Acc {:.4f} | Macro Sens {:.4f} | Macro Spec {:.4f} | Macro Prec {:.4f} | Macro F1 {:.4f}".format(
-            metrics_summary["macro"]["accuracy"],
-            metrics_summary["macro"]["sensitivity"],
-            metrics_summary["macro"]["specificity"],
-            metrics_summary["macro"]["precision"],
-            metrics_summary["macro"]["f1"],
+        "Summary | Acc {:.4f} | Sens {:.4f} | Spec {:.4f} | Prec {:.4f} | F1 {:.4f}".format(
+            metrics_summary["accuracy"],
+            metrics_summary["sensitivity"],
+            metrics_summary["specificity"],
+            metrics_summary["precision"],
+            metrics_summary["f1"],
         )
     )
 
@@ -836,7 +784,7 @@ def train(
 
     val_best_thresh = best_thresh
     if run_test:
-        test_ids, test_map = _read_split_labels_multilabel(labels_dir, class_names, "test")
+        test_ids, test_map = _read_split_labels(labels_dir, task_name, "test")
         if test_ids:
             test_loader = _load_test_from_ids(
                 test_ids,
@@ -861,14 +809,14 @@ def train(
                 xm=xm,
             )
             if xm is None or xm.is_master_ordinal():
-                _plot_confusion_matrix_multi(
-                    y_true_t, y_pred_t, class_names, eval_folder, f"{model_name}_{task_name}_test"
+                _plot_confusion_matrix(
+                    y_true_t, y_pred_t, os.path.join(eval_folder, f"{model_name}_{task_name}_test_confusion.png")
                 )
-                _plot_roc_multi(
-                    y_true_t, y_prob_t, class_names, os.path.join(eval_folder, f"{model_name}_{task_name}_test_roc.png")
+                _plot_roc(
+                    y_true_t, y_prob_t, os.path.join(eval_folder, f"{model_name}_{task_name}_test_roc.png")
                 )
-                test_summary = _compute_confusion_metrics_multi(y_true_t, y_pred_t, class_names)
-                test_summary["best_thresholds"] = best_thresh_t
+                test_summary = _compute_confusion_metrics(y_true_t, y_pred_t)
+                test_summary["best_threshold"] = float(best_thresh_t)
                 test_path = os.path.join(eval_folder, f"{model_name}_{task_name}_test_summary.txt")
                 with open(test_path, "w", encoding="utf-8") as f:
                     for k, v in test_summary.items():
@@ -900,24 +848,14 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     cfg = dict(base_config)
-    class_names = cfg.get("tasks", ["abnormal", "acl", "meniscus"])
-    task_name = cfg.get("task_name", "multilabel")
+    task = cfg.get("task", "acl")
     print("Training Configuration")
     print(cfg)
     if args.kfold and args.kfold > 1:
-        train_ids, train_map = _read_split_labels_multilabel(args.labels_dir, class_names, "train")
-        val_ids, val_map = _read_split_labels_multilabel(args.labels_dir, class_names, "valid")
-        ids = sorted(set(train_ids + val_ids))
-        labels_map = {**train_map, **val_map}
-        y_code = []
-        for rid in ids:
-            lab = labels_map[rid]
-            code = 0
-            for v in lab:
-                code = code * 2 + int(v)
-            y_code.append(code)
+        ids, labels_map = _read_task_labels(args.labels_dir, task)
+        y = [labels_map[i] for i in ids]
         skf = StratifiedKFold(n_splits=args.kfold, shuffle=True, random_state=args.seed)
-        for fold_idx, (train_idx, val_idx) in enumerate(skf.split(ids, y_code)):
+        for fold_idx, (train_idx, val_idx) in enumerate(skf.split(ids, y)):
             ids_train = [ids[i] for i in train_idx]
             ids_val = [ids[i] for i in val_idx]
             loaders = _load_data_from_ids(
@@ -930,7 +868,7 @@ if __name__ == "__main__":
                 image_size=cfg["image_size"],
                 data_dir=args.data_dir,
             )
-            print(f"=== Task {task_name} | Fold {fold_idx + 1}/{args.kfold} ===")
+            print(f"=== Task {task} | Fold {fold_idx + 1}/{args.kfold} ===")
             train(
                 config=cfg,
                 model_name=args.model,

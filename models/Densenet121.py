@@ -22,7 +22,7 @@ class Densenet121(nn.Module):
 
         # Feature dimension for DenseNet121 is 1024
         self.pool = nn.AdaptiveAvgPool2d(1)
-        self.fc = nn.Linear(3 * 1024, 3)
+        self.fc = nn.Linear(3 * 1024, 1)
 
     def _encode_plane(self, net, x):
         # x can be [S, C, H, W] or [B, S, C, H, W]
