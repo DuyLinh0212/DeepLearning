@@ -8,7 +8,10 @@ import torch
 from torch.cuda.amp import autocast, GradScaler
 from sklearn import metrics
 from sklearn.model_selection import StratifiedKFold
-from torch.utils.tensorboard import SummaryWriter
+try:
+    from torch.utils.tensorboard import SummaryWriter
+except Exception:
+    SummaryWriter = None
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 
@@ -26,6 +29,17 @@ try:
     from tqdm import tqdm
 except Exception:
     tqdm = None
+
+
+class _NullWriter:
+    def add_scalar(self, *args, **kwargs):
+        return None
+
+    def flush(self):
+        return None
+
+    def close(self):
+        return None
 
 
 def _build_model(name: str):
@@ -549,8 +563,13 @@ def train(
             import torch_xla.core.xla_model as xm  # type: ignore
             import torch_xla.distributed.parallel_loader as pl  # type: ignore
         except Exception as e:
-            raise RuntimeError("TPU selected but torch_xla is not available.") from e
-        device = xm.xla_device()
+            print("WARNING: TPU selected but torch_xla is not available.")
+            print("Falling back to CPU. To use TPU, install a matching torch_xla for your Python/PyTorch.")
+            xm = None
+            pl = None
+            device = "cpu"
+        else:
+            device = xm.xla_device()
     elif device_arg == "cuda":
         device = "cuda" if torch.cuda.is_available() else "cpu"
     else:
@@ -593,7 +612,10 @@ def train(
         best_val_auc = checkpoint.get("best_val_auc", best_val_auc)
         print(f"Resuming from epoch {starting_epoch} | Best AUC {best_val_auc:.4f}")
 
-    writer = SummaryWriter(comment=f"model={model_name} lr={config['lr']} task={task_name} fold={fold_idx}")
+    if SummaryWriter is None:
+        writer = _NullWriter()
+    else:
+        writer = SummaryWriter(comment=f"model={model_name} lr={config['lr']} task={task_name} fold={fold_idx}")
     t_start_training = time.time()
 
     header = [
