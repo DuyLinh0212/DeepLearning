@@ -16,7 +16,7 @@ from dataset.dataset import INPUT_DIM
 from preprocessing.slice_sampling import uniform_slice_sampling
 from preprocessing.augmentation import random_augmentation
 from config import config as base_config
-from models import Densenet121, EfficientNetB0
+from models import Densenet121, EfficientNetB0, EfficientNetB0_SE_ViT
 from utils import _get_lr
 
 import matplotlib
@@ -34,6 +34,8 @@ def _build_model(name: str):
         return Densenet121()
     if name == "efficientnetb0":
         return EfficientNetB0()
+    if name == "efficientnetb0_se_vit":
+        return EfficientNetB0_SE_ViT()
     raise ValueError(f"Unsupported model: {name}")
 
 
@@ -566,9 +568,9 @@ def train(
     print("Initializing Loss Method...")
     criterion = torch.nn.BCEWithLogitsLoss(pos_weight=train_wts)
     val_criterion = torch.nn.BCEWithLogitsLoss(pos_weight=train_wts)
-    if device == "cuda":
-        criterion = criterion.cuda()
-        val_criterion = val_criterion.cuda()
+    if device != "cpu":
+        criterion = criterion.to(device)
+        val_criterion = val_criterion.to(device)
 
     scaler = GradScaler(enabled=(device == "cuda"))
 
@@ -830,7 +832,7 @@ if __name__ == "__main__":
         "--model",
         type=str,
         default="efficientnetb0",
-        choices=["densenet121", "efficientnetb0"],
+        choices=["densenet121", "efficientnetb0", "efficientnetb0_se_vit"],
         help="Choose model to train",
     )
     parser.add_argument("--kfold", type=int, default=4, help="Enable K-Fold if > 1 (default: 4)")
@@ -841,7 +843,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--device",
         type=str,
-        default="auto",
+        default="tpu",
         choices=["auto", "cpu", "cuda", "tpu"],
         help="Device to use: auto/cpu/cuda/tpu",
     )

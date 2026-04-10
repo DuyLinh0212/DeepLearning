@@ -17,6 +17,7 @@ class EfficientNetB0(nn.Module):
         super().__init__()
 
         self.backbone = _build_efficientnet_b0().features
+        self.se = SqueezeExcite(1280, reduction=16)
 
         # Feature dimension for EfficientNet-B0 is 1280
         self.pool = nn.AdaptiveAvgPool2d(1)
@@ -32,6 +33,7 @@ class EfficientNetB0(nn.Module):
         # x can be [S, C, H, W] or [B, S, C, H, W]
         if x.dim() == 4:
             feat = net(x)
+            feat = self.se(feat)
             feat = self.pool(feat).view(feat.size(0), -1)
             attn = self.attn(feat)  # [S, 1]
             weights = torch.softmax(attn.squeeze(1), dim=0).view(-1, 1)
@@ -44,6 +46,7 @@ class EfficientNetB0(nn.Module):
         b, s, c, h, w = x.shape
         x = x.view(b * s, c, h, w)
         feat = net(x)
+        feat = self.se(feat)
         feat = self.pool(feat).view(feat.size(0), -1)
         feat = feat.view(b, s, -1)
         attn = self.attn(feat)  # [B, S, 1]
@@ -61,3 +64,20 @@ class EfficientNetB0(nn.Module):
         feats = torch.cat([axial, coronal, sagittal], dim=1)
         output = self.fc(feats)
         return output
+
+
+class SqueezeExcite(nn.Module):
+    def __init__(self, channels: int, reduction: int = 16):
+        super().__init__()
+        hidden = max(1, channels // reduction)
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Conv2d(channels, hidden, kernel_size=1, bias=True),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden, channels, kernel_size=1, bias=True),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x):
+        scale = self.fc(self.avg_pool(x))
+        return x * scale
