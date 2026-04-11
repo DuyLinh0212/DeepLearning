@@ -824,8 +824,6 @@ if __name__ == "__main__":
         choices=["densenet121", "efficientnetb0", "efficientnetb0_se_vit"],
         help="Choose model to train",
     )
-    parser.add_argument("--kfold", type=int, default=4, help="Enable K-Fold if > 1 (default: 4)")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed for K-Fold split")
     parser.add_argument("--labels-dir", type=str, default="labels", help="Path to labels directory")
     parser.add_argument("--data-dir", type=str, default="data", help="Path to data directory")
     parser.add_argument("--threshold", type=float, default=0.5, help="Threshold for converting prob to class")
@@ -842,44 +840,13 @@ if __name__ == "__main__":
     task = cfg.get("task", "acl")
     print("Training Configuration")
     print(cfg)
-    if args.kfold and args.kfold > 1:
-        ids, labels_map = _read_task_labels(args.labels_dir, task)
-        y = [labels_map[i] for i in ids]
-        skf = StratifiedKFold(n_splits=args.kfold, shuffle=True, random_state=args.seed)
-        for fold_idx, (train_idx, val_idx) in enumerate(skf.split(ids, y)):
-            ids_train = [ids[i] for i in train_idx]
-            ids_val = [ids[i] for i in val_idx]
-            loaders = _load_data_from_ids(
-                ids_train,
-                ids_val,
-                labels_map,
-                batch_size=cfg["batch_size"],
-                num_workers=cfg["num_workers"],
-                target_slices=cfg["target_slices"],
-                image_size=cfg["image_size"],
-                data_dir=args.data_dir,
-            )
-            print(f"=== Task {task} | Fold {fold_idx + 1}/{args.kfold} ===")
-            train(
-                config=cfg,
-                model_name=args.model,
-                loaders=loaders,
-                fold_idx=fold_idx,
-                resume=False,
-                threshold=args.threshold,
-                labels_dir=args.labels_dir,
-                data_dir=args.data_dir,
-                run_test=True,
-                device_arg=args.device,
-            )
-    else:
-        train(
-            config=cfg,
-            model_name=args.model,
-            threshold=args.threshold,
-            labels_dir=args.labels_dir,
-            data_dir=args.data_dir,
-            run_test=True,
-            device_arg=args.device,
-        )
+    train(
+        config=cfg,
+        model_name=args.model,
+        threshold=args.threshold,
+        labels_dir=args.labels_dir,
+        data_dir=args.data_dir,
+        run_test=True,
+        device_arg=args.device,
+    )
     print("Training Ended...")
