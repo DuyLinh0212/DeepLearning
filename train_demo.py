@@ -908,6 +908,7 @@ if __name__ == "__main__":
     parser.add_argument("--labels-dir", type=str, default="labels", help="Path to labels directory")
     parser.add_argument("--data-dir", type=str, default="data", help="Path to data directory")
     parser.add_argument("--threshold", type=float, default=0.5, help="Threshold for converting prob to class")
+    parser.add_argument("--task", type=str, default=None, help="Override task in config (abnormal/acl/meniscus)")
     parser.add_argument(
         "--device",
         type=str,
@@ -919,6 +920,8 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     cfg = dict(base_config)
+    if args.task:
+        cfg["task"] = args.task
     task = cfg.get("task", "acl")
     print("Training Configuration")
     print(cfg)
