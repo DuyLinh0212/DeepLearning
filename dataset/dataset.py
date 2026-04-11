@@ -7,8 +7,7 @@ import torch.utils.data as data
 from torch.utils.data import WeightedRandomSampler
 from torchvision import transforms
 
-from preprocessing.slice_sampling import uniform_slice_sampling
-from preprocessing.augmentation import random_augmentation
+# Match MRNet src loader behavior (center crop + MRNet normalization)
 
 INPUT_DIM = 224
 
@@ -27,7 +26,6 @@ class MRData(data.Dataset):
             for plane in self.planes:
                 self.image_path[plane] = './data/train/{}/'.format(plane)
         else:
-            transform = None
             self.records = pd.read_csv('./labels/valid-{}.csv'.format(task), header=None, names=['id', 'label'])
             for plane in self.planes:
                 self.image_path[plane] = './data/valid/{}/'.format(plane)
@@ -59,12 +57,7 @@ class MRData(data.Dataset):
         img_raw = {}
         for plane in self.planes:
             img_raw[plane] = np.load(self.paths[plane][index])
-            if self.target_slices is not None:
-                img_raw[plane] = uniform_slice_sampling(img_raw[plane], self.target_slices)
-            if self.train:
-                vol = torch.from_numpy(img_raw[plane])
-                vol = random_augmentation(vol)
-                img_raw[plane] = vol.numpy()
+            # src loader does not resample slices
             img_raw[plane] = self._resize_image(img_raw[plane])
             
         label = self.labels[index]
@@ -73,30 +66,24 @@ class MRData(data.Dataset):
         return [img_raw[plane] for plane in self.planes], label
 
     def _resize_image(self, image):
-        # 1. Resize/Crop (C???t gi???a ???nh)
+        # 1. Center crop to target size (match src loader)
         target = self.input_dim
         if target is not None and target <= image.shape[1] and target <= image.shape[2]:
             pad = int((image.shape[2] - target) / 2)
             image = image[:, pad:-pad, pad:-pad]
-        
-        # 2. Normalize per-volume (z-score)
-        mean = float(np.mean(image))
-        std = float(np.std(image))
-        if std == 0:
-            std = 1.0
-        image = (image - mean) / std
 
-        # 3. Chuy???n sang Tensor
+        # 2. Min-max normalize to [0, 255] (match src loader)
+        min_val = float(np.min(image))
+        max_val = float(np.max(image))
+        denom = max(max_val - min_val, 1e-6)
+        image = (image - min_val) / denom * 255.0
+
+        # 3. To tensor & 3-channel
         image = torch.FloatTensor(image)
+        image = torch.stack((image,) * 3, axis=1)
 
-        # 4. QUAN TR???NG: T???o 3 k??nh m??u (RGB)
-        # Input ??ang l?? (Slices, H, W) -> Stack th??nh (Slices, 3, H, W)
-        image = torch.stack((image,)*3, axis=1)
-
-        # 5. Apply Transform (N???u c??)
+        # 5. Apply transform (e.g., normalization)
         if self.transform:
-            # L??c n??y image c?? d???ng (Slices, 3, H, W)
-            # torchvision s??? coi 'Slices' l?? batch v?? ??p d???ng transform l??n t???ng slice
             image = self.transform(image)
 
         return image
@@ -104,10 +91,16 @@ class MRData(data.Dataset):
 def load_data(task: str, batch_size: int = 1, num_workers: int = 0, target_slices: int = 32, image_size: int = INPUT_DIM):
     # ?????nh ngh??a Augmentation
     # L??u ??: Kh??ng c???n b?????c repeat/permute n???a v?? ???? l??m trong _resize_image
-    augments = transforms.Compose([
-        transforms.RandomRotation(15),
-        transforms.RandomAffine(degrees=0, translate=(0.05, 0.05)),
-    ])
+    mrnet_mean = 58.09
+    mrnet_std = 49.73
+    augments = transforms.Compose(
+        [
+            transforms.Normalize(
+                mean=[mrnet_mean, mrnet_mean, mrnet_mean],
+                std=[mrnet_std, mrnet_std, mrnet_std],
+            ),
+        ]
+    )
 
     print('Loading Train Dataset of {} task...'.format(task))
     train_data = MRData(task, train=True, transform=augments, target_slices=target_slices, input_dim=image_size)
@@ -121,7 +114,7 @@ def load_data(task: str, batch_size: int = 1, num_workers: int = 0, target_slice
     train_loader = data.DataLoader(train_data, batch_size=batch_size, num_workers=num_workers, sampler=sampler)
 
     print('Loading Validation Dataset of {} task...'.format(task))
-    val_data = MRData(task, train=False, target_slices=target_slices, input_dim=image_size)
+    val_data = MRData(task, train=False, transform=augments, target_slices=target_slices, input_dim=image_size)
     val_loader = data.DataLoader(val_data, batch_size=batch_size, num_workers=num_workers, shuffle=False)
 
     return train_loader, val_loader, train_data.weights, val_data.weights

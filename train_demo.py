@@ -6,18 +6,18 @@ import time
 import numpy as np
 import torch
 from torch.cuda.amp import autocast, GradScaler
+import torch.nn.functional as F
 from sklearn import metrics
 from sklearn.model_selection import StratifiedKFold
 try:
     from torch.utils.tensorboard import SummaryWriter
 except Exception:
     SummaryWriter = None
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 from torchvision import transforms
 
 from dataset.dataset import INPUT_DIM
-from preprocessing.slice_sampling import uniform_slice_sampling
-from preprocessing.augmentation import random_augmentation
+# Match MRNet src loader behavior (center crop + MRNet normalization)
 from config import config as base_config
 from models import Densenet121, EfficientNetB0, EfficientNetB0_SE_ViT
 from utils import _get_lr
@@ -86,31 +86,26 @@ class MRDataByIds(Dataset):
         img_raw = {}
         for plane in self.planes:
             img_raw[plane] = np.load(self.paths[plane][index])
-            if self.target_slices is not None:
-                img_raw[plane] = uniform_slice_sampling(img_raw[plane], self.target_slices)
-            if self.train:
-                vol = torch.from_numpy(img_raw[plane])
-                vol = random_augmentation(vol)
-                img_raw[plane] = vol.numpy()
-            img_raw[plane] = self._resize_image(img_raw[plane])
+            # src loader does not resample slices
+            img_raw[plane] = self._prepare_volume(img_raw[plane])
 
         label = self.labels[index]
         label = torch.FloatTensor([1]) if label == 1 else torch.FloatTensor([0])
         return [img_raw[plane] for plane in self.planes], label
 
-    def _resize_image(self, image):
+    def _prepare_volume(self, image):
         target = self.input_dim
         if target is not None and target <= image.shape[1] and target <= image.shape[2]:
             pad = int((image.shape[2] - target) / 2)
             image = image[:, pad:-pad, pad:-pad]
 
-        # Percentile clipping + min-max normalization
-        lower = float(np.percentile(image, 0.5))
-        upper = float(np.percentile(image, 99.5))
-        if upper <= lower:
-            upper = lower + 1e-6
-        image = np.clip(image, lower, upper)
-        image = (image - lower) / (upper - lower)
+        min_val = float(np.min(image))
+        max_val = float(np.max(image))
+        denom = max(max_val - min_val, 1e-6)
+        image = (image - min_val) / denom * 255.0
+
+        # no augmentation (match src behavior)
+
         image = torch.FloatTensor(image)
         image = torch.stack((image,) * 3, axis=1)
         if self.transform:
@@ -156,10 +151,14 @@ def _read_task_labels(labels_dir, task):
 
 
 def _load_data_from_ids(ids_train, ids_val, labels_map, batch_size, num_workers, target_slices, image_size, data_dir):
-    augments = transforms.Compose(
+    mrnet_mean = 58.09
+    mrnet_std = 49.73
+    norm = transforms.Compose(
         [
-            transforms.RandomRotation(15),
-            transforms.RandomAffine(degrees=0, translate=(0.05, 0.05)),
+            transforms.Normalize(
+                mean=[mrnet_mean, mrnet_mean, mrnet_mean],
+                std=[mrnet_std, mrnet_std, mrnet_std],
+            ),
         ]
     )
 
@@ -168,18 +167,23 @@ def _load_data_from_ids(ids_train, ids_val, labels_map, batch_size, num_workers,
         labels_map,
         data_dir=data_dir,
         train=True,
-        transform=augments,
+        transform=norm,
         target_slices=target_slices,
         input_dim=image_size,
     )
-    train_loader = DataLoader(train_data, batch_size=batch_size, num_workers=num_workers, shuffle=True)
+    labels = train_data.labels
+    class_counts = np.bincount(labels)
+    class_weights = 1.0 / np.maximum(class_counts, 1)
+    sample_weights = class_weights[labels]
+    sampler = WeightedRandomSampler(weights=sample_weights, num_samples=len(sample_weights), replacement=True)
+    train_loader = DataLoader(train_data, batch_size=batch_size, num_workers=num_workers, sampler=sampler)
 
     val_data = MRDataByIds(
         ids_val,
         labels_map,
         data_dir=data_dir,
         train=False,
-        transform=None,
+        transform=norm,
         target_slices=target_slices,
         input_dim=image_size,
     )
@@ -188,12 +192,22 @@ def _load_data_from_ids(ids_train, ids_val, labels_map, batch_size, num_workers,
 
 
 def _load_test_from_ids(ids_test, labels_map, batch_size, num_workers, target_slices, image_size, data_dir):
+    mrnet_mean = 58.09
+    mrnet_std = 49.73
+    norm = transforms.Compose(
+        [
+            transforms.Normalize(
+                mean=[mrnet_mean, mrnet_mean, mrnet_mean],
+                std=[mrnet_std, mrnet_std, mrnet_std],
+            ),
+        ]
+    )
     test_data = MRDataByIds(
         ids_test,
         labels_map,
         data_dir=data_dir,
         train=False,
-        transform=None,
+        transform=norm,
         target_slices=target_slices,
         input_dim=image_size,
     )
@@ -212,6 +226,13 @@ def _best_threshold(y_true, y_prob):
         return 0.5
 
 
+def _weighted_bce_prob(prob, target, pos_weight=None, eps=1e-7):
+    prob = prob.clamp(eps, 1.0 - eps)
+    if pos_weight is None:
+        return F.binary_cross_entropy(prob, target)
+    return (-(pos_weight * target * torch.log(prob) + (1.0 - target) * torch.log(1.0 - prob))).mean()
+
+
 def _run_epoch(
     model,
     loader,
@@ -224,6 +245,9 @@ def _run_epoch(
     scaler=None,
     scheduler=None,
     use_amp=False,
+    grad_clip_norm=None,
+    abnormal_model=None,
+    apply_abnormal_prior=False,
 ):
     is_train = optimizer is not None
     model.train() if is_train else model.eval()
@@ -252,23 +276,48 @@ def _run_epoch(
             if use_amp and device != "cpu":
                 with autocast():
                     output = model(images)
-                    loss = criterion(output, label)
+                    if abnormal_model is not None and apply_abnormal_prior:
+                        with torch.no_grad():
+                            abnormal_logits = abnormal_model(images)
+                            abnormal_probs = torch.sigmoid(abnormal_logits)
+                        probs = torch.sigmoid(output) * abnormal_probs
+                        loss = _weighted_bce_prob(probs, label, getattr(criterion, "pos_weight", None))
+                    else:
+                        loss = criterion(output, label)
                 if is_train:
                     scaler.scale(loss).backward()
+                    if grad_clip_norm is not None:
+                        scaler.unscale_(optimizer)
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
                     scaler.step(optimizer)
                     scaler.update()
             else:
                 output = model(images)
-                loss = criterion(output, label)
+                if abnormal_model is not None and apply_abnormal_prior:
+                    with torch.no_grad():
+                        abnormal_logits = abnormal_model(images)
+                        abnormal_probs = torch.sigmoid(abnormal_logits)
+                    probs = torch.sigmoid(output) * abnormal_probs
+                    loss = _weighted_bce_prob(probs, label, getattr(criterion, "pos_weight", None))
+                else:
+                    loss = criterion(output, label)
                 if is_train:
                     loss.backward()
+                    if grad_clip_norm is not None:
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
                     optimizer.step()
             if is_train and scheduler is not None:
                 scheduler.step()
 
         losses.append(loss.item())
 
-        probas = torch.sigmoid(output).detach().cpu().numpy()
+        probas = torch.sigmoid(output)
+        if abnormal_model is not None and (apply_abnormal_prior or not is_train):
+            with torch.no_grad():
+                abnormal_logits = abnormal_model(images)
+                abnormal_probs = torch.sigmoid(abnormal_logits)
+            probas = probas * abnormal_probs
+        probas = probas.detach().cpu().numpy()
         labels = label.detach().cpu().numpy()
 
         y_prob.extend(probas.tolist())
@@ -488,9 +537,26 @@ def _set_trainable(model, train_backbone: bool):
                         p.requires_grad = True
 
 
-def _build_optimizer(model, lr, weight_decay):
-    params = [p for p in model.parameters() if p.requires_grad]
-    return torch.optim.Adam(params, lr=lr, weight_decay=weight_decay)
+def _build_optimizer(model, lr, weight_decay, backbone_lr_mult=0.1):
+    head_params = []
+    backbone_params = []
+    head_keys = ["fc", "attn", "plane_attn", "feat_norm", "feat_dropout", "se"]
+
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        if any(k in name for k in head_keys):
+            head_params.append(p)
+        else:
+            backbone_params.append(p)
+
+    param_groups = []
+    if head_params:
+        param_groups.append({"params": head_params, "lr": lr})
+    if backbone_params:
+        param_groups.append({"params": backbone_params, "lr": lr * backbone_lr_mult})
+
+    return torch.optim.AdamW(param_groups, lr=lr, weight_decay=weight_decay)
 
 
 def _build_onecycle(optimizer, max_lr, epochs, steps_per_epoch):
@@ -515,6 +581,7 @@ def train(
     data_dir="data",
     run_test=True,
     device_arg="auto",
+    abnormal_model_path=None,
 ):
     task_name = config.get("task", "acl")
     fold_suffix = f"fold_{fold_idx}" if fold_idx is not None else None
@@ -574,6 +641,17 @@ def train(
         val_criterion = val_criterion.to(device)
 
     scaler = GradScaler(enabled=(device == "cuda"))
+    abnormal_model = None
+    if abnormal_model_path is not None:
+        print(f"Loading abnormality prior model from {abnormal_model_path}")
+        abnormal_model = _build_model(model_name)
+        state = torch.load(abnormal_model_path, map_location=device)
+        abnormal_model.load_state_dict(state["model_state_dict"] if isinstance(state, dict) else state)
+        if device != "cpu":
+            abnormal_model = abnormal_model.to(device)
+        abnormal_model.eval()
+
+    apply_abnormal_prior = bool(config.get("abnormal_prior_in_train", True))
 
     starting_epoch = config["starting_epoch"]
     num_epochs = config["max_epoch"]
@@ -609,10 +687,16 @@ def train(
     ]
 
     _set_trainable(model, True)
-    optimizer = _build_optimizer(model, config["lr"], config["weight_decay"])
-    scheduler = _build_onecycle(optimizer, config["lr"], num_epochs, len(train_loader))
+    backbone_lr_mult = float(config.get("backbone_lr_mult", 0.1))
+    optimizer = _build_optimizer(model, config["lr"], config["weight_decay"], backbone_lr_mult=backbone_lr_mult)
+    if len(optimizer.param_groups) > 1:
+        max_lr = [config["lr"], config["lr"] * backbone_lr_mult]
+    else:
+        max_lr = config["lr"]
+    scheduler = _build_onecycle(optimizer, max_lr, num_epochs, len(train_loader))
     patience = config.get("patience", 5)
     epochs_no_improve = 0
+    grad_clip_norm = config.get("clip_grad_norm", None)
 
     for epoch in range(starting_epoch, num_epochs):
         current_lr = _get_lr(optimizer)
@@ -629,6 +713,9 @@ def train(
             scaler=scaler,
             scheduler=scheduler,
             use_amp=(device == "cuda"),
+            grad_clip_norm=grad_clip_norm,
+            abnormal_model=abnormal_model,
+            apply_abnormal_prior=apply_abnormal_prior,
         )
         val_loss, val_auc, val_acc, _, _, _, best_thresh = _run_epoch(
             model,
@@ -641,6 +728,8 @@ def train(
             auto_threshold=True,
             scaler=scaler,
             use_amp=(device == "cuda"),
+            abnormal_model=abnormal_model,
+            apply_abnormal_prior=apply_abnormal_prior,
         )
 
         writer.add_scalar("Train/Avg Loss", train_loss, epoch)
@@ -738,6 +827,8 @@ def train(
         phase="val",
         threshold=threshold,
         auto_threshold=True,
+        abnormal_model=abnormal_model,
+        apply_abnormal_prior=apply_abnormal_prior,
     )
 
     _plot_curves(csv_path, os.path.join(eval_folder, f"{model_name}_{task_name}_curves.png"))
@@ -787,6 +878,8 @@ def train(
                 phase="test",
                 threshold=val_best_thresh,
                 auto_threshold=False,
+                abnormal_model=abnormal_model,
+                apply_abnormal_prior=apply_abnormal_prior,
             )
             _plot_confusion_matrix(
                 y_true_t, y_pred_t, os.path.join(eval_folder, f"{model_name}_{task_name}_test_confusion.png")
@@ -822,6 +915,7 @@ if __name__ == "__main__":
         choices=["auto", "cpu", "cuda"],
         help="Device to use: auto/cpu/cuda",
     )
+    parser.add_argument("--abnormal-model", type=str, default=None, help="Path to abnormality prior model")
     args = parser.parse_args()
 
     cfg = dict(base_config)
@@ -836,5 +930,6 @@ if __name__ == "__main__":
         data_dir=args.data_dir,
         run_test=True,
         device_arg=args.device,
+        abnormal_model_path=args.abnormal_model,
     )
     print("Training Ended...")
