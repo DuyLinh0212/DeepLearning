@@ -1,5 +1,4 @@
 import numpy as np
-import numpy as np
 
 
 def uniform_slice_sampling(volume: np.ndarray, target_slices: int = 32) -> np.ndarray:
@@ -26,8 +25,13 @@ def uniform_slice_sampling(volume: np.ndarray, target_slices: int = 32) -> np.nd
         return volume[idx]
 
     # Upsample by repeating the best slice to reach target_slices
-    # "Best" slice is the one with highest variance (most texture/information).
-    scores = np.var(volume.reshape(num_slices, -1), axis=1)
+    # Hybrid score: center proximity + variance.
+    variances = np.var(volume.reshape(num_slices, -1), axis=1)
+    if np.max(variances) > 0:
+        variances = variances / np.max(variances)
+    center = (num_slices - 1) / 2.0
+    center_score = 1.0 - (np.abs(np.arange(num_slices) - center) / (center + 1e-8))
+    scores = 0.5 * variances + 0.5 * center_score
     best_idx = int(np.argmax(scores)) if num_slices > 0 else 0
     repeat_count = target_slices - num_slices
     if repeat_count <= 0:
