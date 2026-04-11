@@ -5,7 +5,7 @@ import torch
 import torch.nn.functional as F
 
 
-def resize_volume_bilinear(volume: np.ndarray, target_size: Union[int, Tuple[int, int]]) -> np.ndarray:
+def resize_volume_bilinear(volume: np.ndarray, target_size: Union[int, Tuple[int, int]] = 256) -> np.ndarray:
     """Resize MRI ve cung kich thuoc bang Bilinear Interpolation.
 
     Args:

@@ -34,7 +34,7 @@ def random_augmentation(volume: torch.Tensor, seed: Optional[int] = None) -> tor
     if volume.dtype != torch.float32:
         volume = volume.float()
 
-    ops = ['rotate', 'hflip', 'crop', 'noise']
+    ops = ['rotate', 'hflip', 'crop']
     op = random.choice(ops)
 
     if op == 'rotate':
@@ -58,6 +58,4 @@ def random_augmentation(volume: torch.Tensor, seed: Optional[int] = None) -> tor
 
         return _apply_per_slice(volume, _crop_and_resize)
 
-    # Gaussian noise
-    noise = torch.randn_like(volume) * 0.05
-    return volume + noise
+    return volume
