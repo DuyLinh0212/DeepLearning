@@ -608,103 +608,80 @@ def train(
         "lr",
     ]
 
-    stages = [
-        {"name": "head", "train_backbone": False, "patience": 5, "max_lr": config["lr"], "use_onecycle": False},
-        {"name": "unfreeze", "train_backbone": True, "patience": 10, "max_lr": config["lr"], "use_onecycle": True},
-        {"name": "finetune", "train_backbone": True, "patience": 10, "max_lr": config["lr"], "use_onecycle": True},
-    ]
+    _set_trainable(model, True)
+    optimizer = _build_optimizer(model, config["lr"], config["weight_decay"])
+    scheduler = _build_onecycle(optimizer, config["lr"], num_epochs, len(train_loader))
+    patience = config.get("patience", 5)
+    epochs_no_improve = 0
 
-    for stage_idx, stage in enumerate(stages):
-        print(f"=== Stage {stage_idx + 1}: {stage['name']} ===")
-        _set_trainable(model, stage["train_backbone"])
-        optimizer = _build_optimizer(model, stage["max_lr"], config["weight_decay"])
-        scheduler = None
-        if stage["use_onecycle"]:
-            scheduler = _build_onecycle(optimizer, stage["max_lr"], num_epochs, len(train_loader))
-        patience = stage["patience"]
-        epochs_no_improve = 0
+    for epoch in range(starting_epoch, num_epochs):
+        current_lr = _get_lr(optimizer)
+        epoch_start_time = time.time()
 
-        for epoch in range(starting_epoch, num_epochs):
-            current_lr = _get_lr(optimizer)
-            epoch_start_time = time.time()
+        train_loss, train_auc, train_acc, _, _, _, _ = _run_epoch(
+            model,
+            train_loader,
+            criterion,
+            optimizer=optimizer,
+            device=device,
+            phase="train",
+            threshold=threshold,
+            scaler=scaler,
+            scheduler=scheduler,
+            use_amp=(device == "cuda"),
+        )
+        val_loss, val_auc, val_acc, _, _, _, best_thresh = _run_epoch(
+            model,
+            val_loader,
+            val_criterion,
+            optimizer=None,
+            device=device,
+            phase="val",
+            threshold=threshold,
+            auto_threshold=True,
+            scaler=scaler,
+            use_amp=(device == "cuda"),
+        )
 
-            train_loss, train_auc, train_acc, _, _, _, _ = _run_epoch(
-                model,
-                train_loader,
-                criterion,
-                optimizer=optimizer,
-                device=device,
-                phase="train",
-                threshold=threshold,
-                scaler=scaler,
-                scheduler=scheduler,
-                use_amp=(device == "cuda"),
+        writer.add_scalar("Train/Avg Loss", train_loss, epoch)
+        writer.add_scalar("Train/AUC_epoch", train_auc, epoch)
+        writer.add_scalar("Train/Acc_epoch", train_acc, epoch)
+        writer.add_scalar("Val/Avg Loss", val_loss, epoch)
+        writer.add_scalar("Val/AUC_epoch", val_auc, epoch)
+        writer.add_scalar("Val/Acc_epoch", val_acc, epoch)
+
+        t_end = time.time()
+        delta = t_end - epoch_start_time
+        thresh_str = f"{best_thresh:.4f}"
+        print(
+            "Epoch [{}/{}] | train loss {:.4f} | train auc {:.4f} | train acc {:.4f} | "
+            "val loss {:.4f} | val auc {:.4f} | val acc {:.4f} | thr [{}] | time {:.2f} s".format(
+                epoch,
+                num_epochs,
+                train_loss,
+                train_auc,
+                train_acc,
+                val_loss,
+                val_auc,
+                val_acc,
+                thresh_str,
+                delta,
             )
-            val_loss, val_auc, val_acc, _, _, _, best_thresh = _run_epoch(
-                model,
-                val_loader,
-                val_criterion,
-                optimizer=None,
-                device=device,
-                phase="val",
-                threshold=threshold,
-                auto_threshold=True,
-                scaler=scaler,
-                use_amp=(device == "cuda"),
-            )
+        )
+        print("-" * 30)
+        writer.flush()
 
-            writer.add_scalar("Train/Avg Loss", train_loss, epoch)
-            writer.add_scalar("Train/AUC_epoch", train_auc, epoch)
-            writer.add_scalar("Train/Acc_epoch", train_acc, epoch)
-            writer.add_scalar("Val/Avg Loss", val_loss, epoch)
-            writer.add_scalar("Val/AUC_epoch", val_auc, epoch)
-            writer.add_scalar("Val/Acc_epoch", val_acc, epoch)
+        _append_csv(
+            csv_path,
+            [epoch, train_loss, train_auc, train_acc, val_loss, val_auc, val_acc, thresh_str, current_lr],
+            header,
+        )
 
-            t_end = time.time()
-            delta = t_end - epoch_start_time
-            thresh_str = f"{best_thresh:.4f}"
-            print(
-                "Epoch [{}/{}] | train loss {:.4f} | train auc {:.4f} | train acc {:.4f} | "
-                "val loss {:.4f} | val auc {:.4f} | val acc {:.4f} | thr [{}] | time {:.2f} s".format(
-                    epoch,
-                    num_epochs,
-                    train_loss,
-                    train_auc,
-                    train_acc,
-                    val_loss,
-                    val_auc,
-                    val_acc,
-                    thresh_str,
-                    delta,
-                )
-            )
-            print("-" * 30)
-            writer.flush()
-
-            _append_csv(
-                csv_path,
-                [epoch, train_loss, train_auc, train_acc, val_loss, val_auc, val_acc, thresh_str, current_lr],
-                header,
-            )
-
-            improved = val_auc > best_val_auc
-            if improved:
-                best_val_auc = val_auc
-                epochs_no_improve = 0
-                print(f"*** New Best AUC: {best_val_auc:.4f}. Saving best model for {model_name}...")
-                state_dict = model.module.state_dict() if use_dataparallel else model.state_dict()
-                torch.save(
-                    {
-                        "model_state_dict": state_dict,
-                        "optimizer_state_dict": optimizer.state_dict(),
-                        "epoch": epoch,
-                        "best_val_auc": best_val_auc,
-                        "model_name": model_name,
-                        "stage": stage["name"],
-                    },
-                    best_model_path,
-                )
-
+        improved = val_auc > best_val_auc
+        if improved:
+            best_val_auc = val_auc
+            epochs_no_improve = 0
+            print(f"*** New Best AUC: {best_val_auc:.4f}. Saving best model for {model_name}...")
             state_dict = model.module.state_dict() if use_dataparallel else model.state_dict()
             torch.save(
                 {
@@ -713,19 +690,30 @@ def train(
                     "epoch": epoch,
                     "best_val_auc": best_val_auc,
                     "model_name": model_name,
-                    "stage": stage["name"],
                 },
-                last_model_path,
+                best_model_path,
             )
-            print(f"Checkpoint saved to {last_model_path}")
 
-            if not improved:
-                epochs_no_improve += 1
-            if epochs_no_improve >= patience:
-                print(f"Early stopping: no improvement in {patience} epochs.")
-                break
+        state_dict = model.module.state_dict() if use_dataparallel else model.state_dict()
+        torch.save(
+            {
+                "model_state_dict": state_dict,
+                "optimizer_state_dict": optimizer.state_dict(),
+                "epoch": epoch,
+                "best_val_auc": best_val_auc,
+                "model_name": model_name,
+            },
+            last_model_path,
+        )
+        print(f"Checkpoint saved to {last_model_path}")
 
-        starting_epoch = 0
+        if not improved:
+            epochs_no_improve += 1
+        if epochs_no_improve >= patience:
+            print(f"Early stopping: no improvement in {patience} epochs.")
+            break
+
+    starting_epoch = 0
 
     t_end_training = time.time()
     print(f"Training finished. Total time: {t_end_training - t_start_training:.2f} s")

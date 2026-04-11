@@ -3,7 +3,7 @@ config = {
     'log_train' : 100,
     'lr' : 3e-5,
     'starting_epoch' : 0,
-    'batch_size' : 4,
+    'batch_size' : 6,
     'log_val' : 10,
     'task' : 'acl', # "meniscus" and  "acl" are the other options
     'weight_decay' : 3e-4,
@@ -13,5 +13,5 @@ config = {
     # Colab-friendly defaults to reduce GPU memory
     'image_size' : 254,
     'target_slices' : 32,
-    'num_workers' : 4
+    'num_workers' : 8
 }
