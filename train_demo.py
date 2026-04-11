@@ -104,11 +104,13 @@ class MRDataByIds(Dataset):
             pad = int((image.shape[2] - target) / 2)
             image = image[:, pad:-pad, pad:-pad]
 
-        mean = float(np.mean(image))
-        std = float(np.std(image))
-        if std == 0:
-            std = 1.0
-        image = (image - mean) / std
+        # Percentile clipping + min-max normalization
+        lower = float(np.percentile(image, 0.5))
+        upper = float(np.percentile(image, 99.5))
+        if upper <= lower:
+            upper = lower + 1e-6
+        image = np.clip(image, lower, upper)
+        image = (image - lower) / (upper - lower)
         image = torch.FloatTensor(image)
         image = torch.stack((image,) * 3, axis=1)
         if self.transform:
@@ -222,7 +224,6 @@ def _run_epoch(
     scaler=None,
     scheduler=None,
     use_amp=False,
-    xm=None,
 ):
     is_train = optimizer is not None
     model.train() if is_train else model.eval()
@@ -254,20 +255,14 @@ def _run_epoch(
                     loss = criterion(output, label)
                 if is_train:
                     scaler.scale(loss).backward()
-                    if xm is not None:
-                        xm.optimizer_step(optimizer, barrier=True)
-                    else:
-                        scaler.step(optimizer)
+                    scaler.step(optimizer)
                     scaler.update()
             else:
                 output = model(images)
                 loss = criterion(output, label)
                 if is_train:
                     loss.backward()
-                    if xm is not None:
-                        xm.optimizer_step(optimizer, barrier=True)
-                    else:
-                        optimizer.step()
+                    optimizer.step()
             if is_train and scheduler is not None:
                 scheduler.step()
 
@@ -557,20 +552,7 @@ def train(
 
     print("Initializing Model...")
     model = _build_model(model_name)
-    xm = None
-    if device_arg == "tpu":
-        try:
-            import torch_xla.core.xla_model as xm  # type: ignore
-            import torch_xla.distributed.parallel_loader as pl  # type: ignore
-        except Exception as e:
-            print("WARNING: TPU selected but torch_xla is not available.")
-            print("Falling back to CPU. To use TPU, install a matching torch_xla for your Python/PyTorch.")
-            xm = None
-            pl = None
-            device = "cpu"
-        else:
-            device = xm.xla_device()
-    elif device_arg == "cuda":
+    if device_arg == "cuda":
         device = "cuda" if torch.cuda.is_available() else "cpu"
     else:
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -592,10 +574,6 @@ def train(
         val_criterion = val_criterion.to(device)
 
     scaler = GradScaler(enabled=(device == "cuda"))
-
-    if xm is not None:
-        train_loader = pl.MpDeviceLoader(train_loader, device)
-        val_loader = pl.MpDeviceLoader(val_loader, device)
 
     starting_epoch = config["starting_epoch"]
     num_epochs = config["max_epoch"]
@@ -661,7 +639,6 @@ def train(
                 scaler=scaler,
                 scheduler=scheduler,
                 use_amp=(device == "cuda"),
-                xm=xm,
             )
             val_loss, val_auc, val_acc, _, _, _, best_thresh = _run_epoch(
                 model,
@@ -674,7 +651,6 @@ def train(
                 auto_threshold=True,
                 scaler=scaler,
                 use_amp=(device == "cuda"),
-                xm=xm,
             )
 
             writer.add_scalar("Train/Avg Loss", train_loss, epoch)
@@ -716,21 +692,6 @@ def train(
                 best_val_auc = val_auc
                 epochs_no_improve = 0
                 print(f"*** New Best AUC: {best_val_auc:.4f}. Saving best model for {model_name}...")
-                if xm is None or xm.is_master_ordinal():
-                    state_dict = model.module.state_dict() if use_dataparallel else model.state_dict()
-                    torch.save(
-                        {
-                            "model_state_dict": state_dict,
-                            "optimizer_state_dict": optimizer.state_dict(),
-                            "epoch": epoch,
-                            "best_val_auc": best_val_auc,
-                            "model_name": model_name,
-                            "stage": stage["name"],
-                        },
-                        best_model_path,
-                    )
-
-            if xm is None or xm.is_master_ordinal():
                 state_dict = model.module.state_dict() if use_dataparallel else model.state_dict()
                 torch.save(
                     {
@@ -741,9 +702,22 @@ def train(
                         "model_name": model_name,
                         "stage": stage["name"],
                     },
-                    last_model_path,
+                    best_model_path,
                 )
-                print(f"Checkpoint saved to {last_model_path}")
+
+            state_dict = model.module.state_dict() if use_dataparallel else model.state_dict()
+            torch.save(
+                {
+                    "model_state_dict": state_dict,
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "epoch": epoch,
+                    "best_val_auc": best_val_auc,
+                    "model_name": model_name,
+                    "stage": stage["name"],
+                },
+                last_model_path,
+            )
+            print(f"Checkpoint saved to {last_model_path}")
 
             if not improved:
                 epochs_no_improve += 1
@@ -778,18 +752,16 @@ def train(
         auto_threshold=True,
     )
 
-    if xm is None or xm.is_master_ordinal():
-        _plot_curves(csv_path, os.path.join(eval_folder, f"{model_name}_{task_name}_curves.png"))
-        _plot_confusion_matrix(y_true, y_pred, os.path.join(eval_folder, f"{model_name}_{task_name}_confusion.png"))
-        _plot_roc(y_true, y_prob, os.path.join(eval_folder, f"{model_name}_{task_name}_roc.png"))
+    _plot_curves(csv_path, os.path.join(eval_folder, f"{model_name}_{task_name}_curves.png"))
+    _plot_confusion_matrix(y_true, y_pred, os.path.join(eval_folder, f"{model_name}_{task_name}_confusion.png"))
+    _plot_roc(y_true, y_prob, os.path.join(eval_folder, f"{model_name}_{task_name}_roc.png"))
 
     metrics_summary = _compute_confusion_metrics(y_true, y_pred)
     metrics_summary["best_threshold"] = float(best_thresh)
     summary_path = os.path.join(eval_folder, f"{model_name}_{task_name}_summary.txt")
-    if xm is None or xm.is_master_ordinal():
-        with open(summary_path, "w", encoding="utf-8") as f:
-            for k, v in metrics_summary.items():
-                f.write(f"{k}: {v}\n")
+    with open(summary_path, "w", encoding="utf-8") as f:
+        for k, v in metrics_summary.items():
+            f.write(f"{k}: {v}\n")
 
     print(
         "Summary | Acc {:.4f} | Sens {:.4f} | Spec {:.4f} | Prec {:.4f} | F1 {:.4f}".format(
@@ -801,10 +773,9 @@ def train(
         )
     )
 
-    if xm is None or xm.is_master_ordinal():
-        print(f"Metrics saved to: {csv_path}")
-        print(f"Plots saved to: {eval_folder}")
-        print(f"Summary saved to: {summary_path}")
+    print(f"Metrics saved to: {csv_path}")
+    print(f"Plots saved to: {eval_folder}")
+    print(f"Summary saved to: {summary_path}")
 
     val_best_thresh = best_thresh
     if run_test:
@@ -819,8 +790,6 @@ def train(
                 image_size=config["image_size"],
                 data_dir=data_dir,
             )
-            if xm is not None:
-                test_loader = pl.MpDeviceLoader(test_loader, device)
             _, _, _, y_true_t, y_prob_t, y_pred_t, best_thresh_t = _run_epoch(
                 model,
                 test_loader,
@@ -830,22 +799,20 @@ def train(
                 phase="test",
                 threshold=val_best_thresh,
                 auto_threshold=False,
-                xm=xm,
             )
-            if xm is None or xm.is_master_ordinal():
-                _plot_confusion_matrix(
-                    y_true_t, y_pred_t, os.path.join(eval_folder, f"{model_name}_{task_name}_test_confusion.png")
-                )
-                _plot_roc(
-                    y_true_t, y_prob_t, os.path.join(eval_folder, f"{model_name}_{task_name}_test_roc.png")
-                )
-                test_summary = _compute_confusion_metrics(y_true_t, y_pred_t)
-                test_summary["best_threshold"] = float(best_thresh_t)
-                test_path = os.path.join(eval_folder, f"{model_name}_{task_name}_test_summary.txt")
-                with open(test_path, "w", encoding="utf-8") as f:
-                    for k, v in test_summary.items():
-                        f.write(f"{k}: {v}\n")
-                print(f"Test summary saved to: {test_path}")
+            _plot_confusion_matrix(
+                y_true_t, y_pred_t, os.path.join(eval_folder, f"{model_name}_{task_name}_test_confusion.png")
+            )
+            _plot_roc(
+                y_true_t, y_prob_t, os.path.join(eval_folder, f"{model_name}_{task_name}_test_roc.png")
+            )
+            test_summary = _compute_confusion_metrics(y_true_t, y_pred_t)
+            test_summary["best_threshold"] = float(best_thresh_t)
+            test_path = os.path.join(eval_folder, f"{model_name}_{task_name}_test_summary.txt")
+            with open(test_path, "w", encoding="utf-8") as f:
+                for k, v in test_summary.items():
+                    f.write(f"{k}: {v}\n")
+            print(f"Test summary saved to: {test_path}")
 
 
 if __name__ == "__main__":
@@ -865,9 +832,9 @@ if __name__ == "__main__":
     parser.add_argument(
         "--device",
         type=str,
-        default="tpu",
-        choices=["auto", "cpu", "cuda", "tpu"],
-        help="Device to use: auto/cpu/cuda/tpu",
+        default="auto",
+        choices=["auto", "cpu", "cuda"],
+        help="Device to use: auto/cpu/cuda",
     )
     args = parser.parse_args()
 
