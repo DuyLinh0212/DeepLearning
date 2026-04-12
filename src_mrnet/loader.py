@@ -19,6 +19,11 @@ class Dataset(data.Dataset):
         super().__init__()
         self.use_gpu = use_gpu
 
+        def _norm_id(raw_id):
+            # Normalize ids from CSV (e.g., "0", "0000", "0000.npy", or paths)
+            base = os.path.splitext(os.path.basename(str(raw_id)))[0]
+            return base.zfill(4)
+
         label_dict = {}
         self.paths = []
         abnormal_label_dict = {}
@@ -29,7 +34,7 @@ class Dataset(data.Dataset):
         label_path = os.path.join(labels_dir, f"{split}-{tear_type}.csv")
         for line in open(label_path).readlines():
             line = line.strip().split(',')
-            filename = line[0]
+            filename = _norm_id(line[0])
             label = line[1]
             label_dict[filename] = int(label)
 
@@ -37,13 +42,12 @@ class Dataset(data.Dataset):
         if os.path.exists(abnormal_path):
             for line in open(abnormal_path).readlines():
                 line = line.strip().split(',')
-                filename = line[0]
+                filename = _norm_id(line[0])
                 label = line[1]
                 abnormal_label_dict[filename] = int(label)
 
         for rid in label_dict.keys():
-            rid_str = str(rid).zfill(4)
-            filename = f"{rid_str}.npy"
+            filename = f"{rid}.npy"
             self.paths.append(filename)
 
         self.labels = [label_dict[path.split(".")[0]] for path in self.paths]
