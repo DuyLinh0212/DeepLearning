@@ -13,11 +13,14 @@ INPUT_DIM = 224
 MAX_PIXEL_VAL = 255
 MEAN = 58.09
 STDDEV = 49.73
+IMAGENET_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_STD = (0.229, 0.224, 0.225)
 
 class Dataset(data.Dataset):
-    def __init__(self, data_dir, labels_dir, split, tear_type, use_gpu):
+    def __init__(self, data_dir, labels_dir, split, tear_type, use_gpu, backbone="alexnet"):
         super().__init__()
         self.use_gpu = use_gpu
+        self.backbone = backbone
 
         def _norm_id(raw_id):
             # Normalize ids from CSV (e.g., "0", "0000", "0000.npy", or paths)
@@ -78,28 +81,45 @@ class Dataset(data.Dataset):
         vol_sagit = np.load(os.path.join(self.datadir, "sagittal", filename))
         vol_coron = np.load(os.path.join(self.datadir, "coronal", filename))
 
+        use_imagenet_norm = self.backbone.startswith("efficientnet")
+
         # axial
         pad = int((vol_axial.shape[2] - INPUT_DIM)/2)
         vol_axial = vol_axial[:,pad:-pad,pad:-pad]
-        vol_axial = (vol_axial-np.min(vol_axial))/(np.max(vol_axial)-np.min(vol_axial))*MAX_PIXEL_VAL
-        vol_axial = (vol_axial - MEAN) / STDDEV
-        vol_axial = np.stack((vol_axial,)*3, axis=1)
+        vol_axial = (vol_axial-np.min(vol_axial))/(np.max(vol_axial)-np.min(vol_axial))
+        if use_imagenet_norm:
+            vol_axial = np.stack((vol_axial,)*3, axis=1)
+            vol_axial = (vol_axial - np.array(IMAGENET_MEAN)[None, :, None, None]) / np.array(IMAGENET_STD)[None, :, None, None]
+        else:
+            vol_axial = vol_axial * MAX_PIXEL_VAL
+            vol_axial = (vol_axial - MEAN) / STDDEV
+            vol_axial = np.stack((vol_axial,)*3, axis=1)
         vol_axial_tensor = torch.FloatTensor(vol_axial)
         
         # sagittal
         pad = int((vol_sagit.shape[2] - INPUT_DIM)/2)
         vol_sagit = vol_sagit[:,pad:-pad,pad:-pad]
-        vol_sagit = (vol_sagit-np.min(vol_sagit))/(np.max(vol_sagit)-np.min(vol_sagit))*MAX_PIXEL_VAL
-        vol_sagit = (vol_sagit - MEAN) / STDDEV
-        vol_sagit = np.stack((vol_sagit,)*3, axis=1)
+        vol_sagit = (vol_sagit-np.min(vol_sagit))/(np.max(vol_sagit)-np.min(vol_sagit))
+        if use_imagenet_norm:
+            vol_sagit = np.stack((vol_sagit,)*3, axis=1)
+            vol_sagit = (vol_sagit - np.array(IMAGENET_MEAN)[None, :, None, None]) / np.array(IMAGENET_STD)[None, :, None, None]
+        else:
+            vol_sagit = vol_sagit * MAX_PIXEL_VAL
+            vol_sagit = (vol_sagit - MEAN) / STDDEV
+            vol_sagit = np.stack((vol_sagit,)*3, axis=1)
         vol_sagit_tensor = torch.FloatTensor(vol_sagit)
 
         # coronal
         pad = int((vol_coron.shape[2] - INPUT_DIM)/2)
         vol_coron = vol_coron[:,pad:-pad,pad:-pad]
-        vol_coron = (vol_coron-np.min(vol_coron))/(np.max(vol_coron)-np.min(vol_coron))*MAX_PIXEL_VAL
-        vol_coron = (vol_coron - MEAN) / STDDEV
-        vol_coron = np.stack((vol_coron,)*3, axis=1)
+        vol_coron = (vol_coron-np.min(vol_coron))/(np.max(vol_coron)-np.min(vol_coron))
+        if use_imagenet_norm:
+            vol_coron = np.stack((vol_coron,)*3, axis=1)
+            vol_coron = (vol_coron - np.array(IMAGENET_MEAN)[None, :, None, None]) / np.array(IMAGENET_STD)[None, :, None, None]
+        else:
+            vol_coron = vol_coron * MAX_PIXEL_VAL
+            vol_coron = (vol_coron - MEAN) / STDDEV
+            vol_coron = np.stack((vol_coron,)*3, axis=1)
         vol_coron_tensor = torch.FloatTensor(vol_coron)
 
         label_tensor = torch.FloatTensor([self.labels[index]])
@@ -109,10 +129,10 @@ class Dataset(data.Dataset):
     def __len__(self):
         return len(self.paths)
 
-def load_data(task="acl", use_gpu=False, data_dir="data", labels_dir="labels", num_workers=8):
-    train_dataset = Dataset(data_dir, labels_dir, "train", task, use_gpu)
-    valid_dataset = Dataset(data_dir, labels_dir, "valid", task, use_gpu)
-    test_dataset = Dataset(data_dir, labels_dir, "test", task, use_gpu)
+def load_data(task="acl", use_gpu=False, data_dir="data", labels_dir="labels", num_workers=8, backbone="alexnet"):
+    train_dataset = Dataset(data_dir, labels_dir, "train", task, use_gpu, backbone=backbone)
+    valid_dataset = Dataset(data_dir, labels_dir, "valid", task, use_gpu, backbone=backbone)
+    test_dataset = Dataset(data_dir, labels_dir, "test", task, use_gpu, backbone=backbone)
 
     pin_memory = bool(use_gpu)
     train_loader = data.DataLoader(

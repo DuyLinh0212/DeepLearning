@@ -28,7 +28,12 @@ def train(
     checkpoint_every=1,
 ):
     train_loader, valid_loader, test_loader = load_data(
-        task, use_gpu, data_dir=data_dir, labels_dir=labels_dir, num_workers=num_workers
+        task,
+        use_gpu,
+        data_dir=data_dir,
+        labels_dir=labels_dir,
+        num_workers=num_workers,
+        backbone=backbone,
     )
 
     if abnormal_model_path and not os.path.isfile(abnormal_model_path):
