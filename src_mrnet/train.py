@@ -3,6 +3,7 @@ import json
 import numpy as np
 import os
 import torch
+import re
 
 from datetime import datetime
 from pathlib import Path
@@ -29,17 +30,25 @@ def train(
     train_loader, valid_loader, test_loader = load_data(
         task, use_gpu, data_dir=data_dir, labels_dir=labels_dir, num_workers=num_workers
     )
+
+    if abnormal_model_path and not os.path.isfile(abnormal_model_path):
+        raise FileNotFoundError(f"abnormal_model_path not found: {abnormal_model_path}")
     
     model = TripleMRNet(backbone=backbone)
+    max_epoch = 0
     for dirpath, dirnames, files in os.walk(args.rundir):
         if not files:
             break
-        max_epoch = 0
         model_path = None
         for fname in files:
             if fname.endswith(".json"):
                 continue
-            ep = int(fname[27:])
+            if "checkpoint" in fname:
+                continue
+            match = re.search(r"epoch(\d+)", fname)
+            if not match:
+                continue
+            ep = int(match.group(1))
             if ep >= max_epoch:
                 max_epoch = ep
                 model_path = os.path.join(dirpath, fname)
