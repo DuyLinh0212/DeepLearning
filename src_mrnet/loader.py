@@ -109,11 +109,35 @@ class Dataset(data.Dataset):
     def __len__(self):
         return len(self.paths)
 
-def load_data(task="acl", use_gpu=False, data_dir="data", labels_dir="labels"):
+def load_data(task="acl", use_gpu=False, data_dir="data", labels_dir="labels", num_workers=8):
     train_dataset = Dataset(data_dir, labels_dir, "train", task, use_gpu)
     valid_dataset = Dataset(data_dir, labels_dir, "valid", task, use_gpu)
+    test_dataset = Dataset(data_dir, labels_dir, "test", task, use_gpu)
 
-    train_loader = data.DataLoader(train_dataset, batch_size=1, num_workers=1, shuffle=True)
-    valid_loader = data.DataLoader(valid_dataset, batch_size=1, num_workers=1, shuffle=False)
+    pin_memory = bool(use_gpu)
+    train_loader = data.DataLoader(
+        train_dataset,
+        batch_size=1,
+        num_workers=num_workers,
+        shuffle=True,
+        pin_memory=pin_memory,
+        persistent_workers=num_workers > 0,
+    )
+    valid_loader = data.DataLoader(
+        valid_dataset,
+        batch_size=1,
+        num_workers=num_workers,
+        shuffle=False,
+        pin_memory=pin_memory,
+        persistent_workers=num_workers > 0,
+    )
+    test_loader = data.DataLoader(
+        test_dataset,
+        batch_size=1,
+        num_workers=num_workers,
+        shuffle=False,
+        pin_memory=pin_memory,
+        persistent_workers=num_workers > 0,
+    )
 
-    return train_loader, valid_loader
+    return train_loader, valid_loader, test_loader

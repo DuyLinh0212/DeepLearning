@@ -20,7 +20,7 @@ class MRNet(nn.Module):
         return x
 
 class TripleMRNet(nn.Module):
-    def __init__(self, backbone="resnet18", training=True):
+    def __init__(self, backbone="efficientnet_b0", training=True):
         super().__init__()
         self.backbone = backbone
         if self.backbone == "resnet18":
@@ -31,6 +31,8 @@ class TripleMRNet(nn.Module):
                 param.requires_grad = False
         elif self.backbone == "alexnet":
             self.axial_net = models.alexnet(pretrained=training)
+        elif self.backbone == "efficientnet_b0":
+            self.axial_net = _build_efficientnet_b0(training)
 
         if self.backbone == "resnet18":
             resnet = models.resnet18(pretrained=training)
@@ -40,6 +42,8 @@ class TripleMRNet(nn.Module):
                 param.requires_grad = False
         elif self.backbone == "alexnet":
             self.sagit_net = models.alexnet(pretrained=training)
+        elif self.backbone == "efficientnet_b0":
+            self.sagit_net = _build_efficientnet_b0(training)
         
         if self.backbone == "resnet18":
             resnet = models.resnet18(pretrained=training)
@@ -49,6 +53,8 @@ class TripleMRNet(nn.Module):
                 param.requires_grad = False
         elif self.backbone == "alexnet":
             self.coron_net = models.alexnet(pretrained=training)
+        elif self.backbone == "efficientnet_b0":
+            self.coron_net = _build_efficientnet_b0(training)
 
         self.gap_axial = nn.AdaptiveAvgPool2d(1)
         self.gap_sagit = nn.AdaptiveAvgPool2d(1)
@@ -58,6 +64,8 @@ class TripleMRNet(nn.Module):
             self.classifier = nn.Linear(3*512, 1)
         elif self.backbone == "alexnet":
             self.classifier = nn.Linear(3*256, 1)
+        elif self.backbone == "efficientnet_b0":
+            self.classifier = nn.Linear(3*1280, 1)
 
     def forward(self, vol_axial, vol_sagit, vol_coron):
         vol_axial = torch.squeeze(vol_axial, dim=0)
@@ -72,6 +80,10 @@ class TripleMRNet(nn.Module):
             vol_axial = self.axial_net.features(vol_axial)
             vol_sagit = self.sagit_net.features(vol_sagit)
             vol_coron = self.coron_net.features(vol_coron)
+        elif self.backbone == "efficientnet_b0":
+            vol_axial = self.axial_net.features(vol_axial)
+            vol_sagit = self.sagit_net.features(vol_sagit)
+            vol_coron = self.coron_net.features(vol_coron)
 
         vol_axial = self.gap_axial(vol_axial).view(vol_axial.size(0), -1)
         x = torch.max(vol_axial, 0, keepdim=True)[0]
@@ -83,3 +95,11 @@ class TripleMRNet(nn.Module):
         w = torch.cat((x, y, z), 1)
         out = self.classifier(w)
         return out
+
+
+def _build_efficientnet_b0(training):
+    # Support both new and old torchvision APIs
+    if hasattr(models, "EfficientNet_B0_Weights"):
+        weights = models.EfficientNet_B0_Weights.DEFAULT if training else None
+        return models.efficientnet_b0(weights=weights)
+    return models.efficientnet_b0(pretrained=training)
