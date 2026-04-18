@@ -11,6 +11,14 @@ MAX_PIXEL_VAL = 255
 MEAN = 58.09
 STDDEV = 49.73
 
+
+def _normalize_id(raw_id):
+    base = os.path.splitext(os.path.basename(str(raw_id).strip()))[0]
+    if base.isdigit():
+        return str(int(base))
+    return base
+
+
 class Dataset(data.Dataset):
     def __init__(self, datadir, tear_type, use_gpu, labels_dir=None):
         super().__init__()
@@ -28,22 +36,41 @@ class Dataset(data.Dataset):
 
         for i, line in enumerate(open(label_root + '-' + tear_type + '.csv').readlines()):
             line = line.strip().split(',')
-            filename = line[0]
+            filename = _normalize_id(line[0])
             label = line[1]
             label_dict[filename] = int(label)
 
         for i, line in enumerate(open(label_root + '-' + "abnormal" + '.csv').readlines()):
             line = line.strip().split(',')
-            filename = line[0]
+            filename = _normalize_id(line[0])
             label = line[1]
             abnormal_label_dict[filename] = int(label)
 
         for filename in os.listdir(os.path.join(datadir, "axial")):
             if filename.endswith(".npy"):
                 self.paths.append(filename)
-        
-        self.labels = [label_dict[path.split(".")[0]] for path in self.paths]
-        self.abnormal_labels = [abnormal_label_dict[path.split(".")[0]] for path in self.paths]
+
+        self.paths.sort()
+        all_paths = list(self.paths)
+        filtered_paths = []
+        for path in all_paths:
+            pid = _normalize_id(path)
+            if pid in label_dict and pid in abnormal_label_dict:
+                filtered_paths.append(path)
+        self.paths = filtered_paths
+        dropped = len(all_paths) - len(self.paths)
+        if dropped > 0:
+            print(f"[Dataset] Dropped {dropped} samples without matching labels in {self.datadir}")
+
+        if not self.paths:
+            raise ValueError(
+                f"No labeled samples found in {self.datadir}. "
+                f"Check label files: {label_root + '-' + tear_type + '.csv'} and "
+                f"{label_root + '-abnormal.csv'}"
+            )
+
+        self.labels = [label_dict[_normalize_id(path)] for path in self.paths]
+        self.abnormal_labels = [abnormal_label_dict[_normalize_id(path)] for path in self.paths]
 
         if tear_type != "abnormal":
             temp_labels = [self.labels[i] for i in range(len(self.labels)) if self.abnormal_labels[i]==1]
