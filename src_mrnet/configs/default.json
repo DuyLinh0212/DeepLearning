@@ -13,6 +13,7 @@
   "backbone_lr_mult": 0.2,
   "weight_decay": 0.0001,
   "dropout": 0.4,
+  "projected_dim": 256,
   "pretrained": true,
   "grad_clip_norm": 1.0,
   "mixed_precision": false,

@@ -6,7 +6,7 @@ from torchvision import models
 
 
 class SliceEncoderEfficientNetB0(nn.Module):
-    def __init__(self, pretrained: bool = True) -> None:
+    def __init__(self, pretrained: bool = True, projected_dim: int = 256) -> None:
         super().__init__()
         if hasattr(models, "EfficientNet_B0_Weights"):
             weights = models.EfficientNet_B0_Weights.DEFAULT if pretrained else None
@@ -16,26 +16,28 @@ class SliceEncoderEfficientNetB0(nn.Module):
 
         self.features = backbone.features
         self.pool = nn.AdaptiveAvgPool2d(1)
-        self.out_dim = 1280
+        self.feature_projection = nn.Linear(1280, projected_dim)
+        self.out_dim = projected_dim
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.features(x)
         x = self.pool(x).flatten(1)
+        x = self.feature_projection(x)
         return x
 
 
 class TripleMRNetEfficientNetB0(nn.Module):
-    def __init__(self, pretrained: bool = True, dropout: float = 0.4) -> None:
+    def __init__(self, pretrained: bool = True, dropout: float = 0.4, projected_dim: int = 256) -> None:
         super().__init__()
-        self.axial_encoder = SliceEncoderEfficientNetB0(pretrained=pretrained)
-        self.sagittal_encoder = SliceEncoderEfficientNetB0(pretrained=pretrained)
-        self.coronal_encoder = SliceEncoderEfficientNetB0(pretrained=pretrained)
+        self.axial_encoder = SliceEncoderEfficientNetB0(pretrained=pretrained, projected_dim=projected_dim)
+        self.sagittal_encoder = SliceEncoderEfficientNetB0(pretrained=pretrained, projected_dim=projected_dim)
+        self.coronal_encoder = SliceEncoderEfficientNetB0(pretrained=pretrained, projected_dim=projected_dim)
+        self.post_pool_dropout = nn.Dropout(dropout)
 
         feature_dim = self.axial_encoder.out_dim
         self.classifier = nn.Sequential(
             nn.Linear(feature_dim * 3, 512),
             nn.ReLU(inplace=True),
-            nn.Dropout(dropout),
             nn.Linear(512, 1),
         )
 
@@ -51,7 +53,9 @@ class TripleMRNetEfficientNetB0(nn.Module):
 
     @staticmethod
     def _pool_over_slices(slice_features: torch.Tensor) -> torch.Tensor:
-        return torch.max(slice_features, dim=0, keepdim=True).values
+        max_features = torch.max(slice_features, dim=0, keepdim=True).values
+        avg_features = torch.mean(slice_features, dim=0, keepdim=True)
+        return 0.5 * (max_features + avg_features)
 
     def _encode_volume(self, volume: torch.Tensor, encoder: nn.Module) -> torch.Tensor:
         if volume.ndim == 5 and volume.shape[0] == 1:
@@ -59,7 +63,8 @@ class TripleMRNetEfficientNetB0(nn.Module):
         if volume.ndim != 4:
             raise ValueError(f"Volume must be [S, 3, H, W], received shape {tuple(volume.shape)}")
         slice_features = encoder(volume)
-        return self._pool_over_slices(slice_features)
+        pooled_features = self._pool_over_slices(slice_features)
+        return self.post_pool_dropout(pooled_features)
 
     def forward(
         self,

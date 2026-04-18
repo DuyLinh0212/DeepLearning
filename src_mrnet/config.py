@@ -20,6 +20,7 @@ class TrainConfig:
     backbone_lr_mult: float = 0.2
     weight_decay: float = 1e-4
     dropout: float = 0.4
+    projected_dim: int = 256
     pretrained: bool = True
     grad_clip_norm: float = 1.0
     mixed_precision: bool = False
@@ -65,6 +66,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--backbone_lr_mult", type=float, default=None)
     parser.add_argument("--weight_decay", type=float, default=None)
     parser.add_argument("--dropout", type=float, default=None)
+    parser.add_argument("--projected_dim", type=int, default=None)
     parser.add_argument("--grad_clip_norm", type=float, default=None)
     parser.add_argument("--scheduler_factor", type=float, default=None)
     parser.add_argument("--scheduler_patience", type=int, default=None)

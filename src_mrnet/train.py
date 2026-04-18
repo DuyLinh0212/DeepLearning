@@ -194,6 +194,7 @@ def train(config: TrainConfig) -> None:
     model = TripleMRNetEfficientNetB0(
         pretrained=config.pretrained,
         dropout=config.dropout,
+        projected_dim=config.projected_dim,
     ).to(device)
 
     backbone_params, classifier_params = split_optimizer_parameters(model)
