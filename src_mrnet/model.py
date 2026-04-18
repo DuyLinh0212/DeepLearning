@@ -1,180 +1,84 @@
+from typing import List, Sequence, Union
+
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torchvision import models
 
 
-class SafeBatchNorm1d(nn.BatchNorm1d):
-    """
-    BatchNorm1d an toàn cho batch_size=1.
-    Khi train mà batch chỉ có 1 sample, dùng running stats thay vì batch stats
-    để tránh lỗi/dao động.
-    """
-    def forward(self, input):
-        if self.training and input.dim() == 2 and input.size(0) == 1:
-            return F.batch_norm(
-                input,
-                self.running_mean,
-                self.running_var,
-                self.weight,
-                self.bias,
-                False,
-                self.momentum,
-                self.eps,
-            )
-        return super().forward(input)
-
-
-def replace_bn_with_gn(model, num_groups=8):
-    """
-    Đệ quy thay tất cả BatchNorm2d bằng GroupNorm.
-    Chọn số groups lớn nhất chia hết num_features, tối thiểu là 2 để tránh
-    suy biến thành InstanceNorm (groups=1) gây mất ổn định khi batch_size=1.
-    Nếu num_features < 2 thì giữ nguyên BatchNorm.
-    """
-    for name, module in model.named_children():
-        if isinstance(module, nn.BatchNorm2d):
-            num_features = module.num_features
-            # Tìm số groups lớn nhất chia hết num_features, nhưng tối thiểu là 2
-            groups = num_groups
-            while num_features % groups != 0:
-                groups -= 1
-            if groups < 2:
-                # Không thể tạo GroupNorm hợp lệ, giữ nguyên BatchNorm
-                continue
-            gn = nn.GroupNorm(num_groups=groups, num_channels=num_features,
-                              affine=True)
-            # Copy lại weight/bias đã học từ pretrained để không mất thông tin
-            gn.weight.data.copy_(module.weight.data)
-            gn.bias.data.copy_(module.bias.data)
-            setattr(model, name, gn)
-        else:
-            replace_bn_with_gn(module, num_groups)
-    return model
-
-
-def _build_backbone(backbone, training):
-    """Tạo một backbone đơn lẻ và trả về (net, feature_dim)."""
-    if backbone == "resnet18":
-        weights = None
-        if training and hasattr(models, "ResNet18_Weights"):
-            weights = models.ResNet18_Weights.DEFAULT
-        net = models.resnet18(weights=weights) if weights is not None \
-            else models.resnet18(pretrained=training)
-        # Bỏ lớp FC cuối, giữ AdaptiveAvgPool → output shape (B, 512, 1, 1)
-        net = nn.Sequential(*list(net.children())[:-1])
-        for param in net.parameters():
-            param.requires_grad = False
-        feature_dim = 512
-
-    elif backbone == "alexnet":
-        if hasattr(models, "AlexNet_Weights"):
-            weights = models.AlexNet_Weights.DEFAULT if training else None
-            net = models.alexnet(weights=weights)
-        else:
-            net = models.alexnet(pretrained=training)
-        feature_dim = 256  # output của features[-1] sau GAP
-
-    elif backbone == "efficientnet_b0":
-        if hasattr(models, "EfficientNet_B0_Weights"):
-            weights = models.EfficientNet_B0_Weights.DEFAULT if training else None
-            net = models.efficientnet_b0(weights=weights)
-        else:
-            net = models.efficientnet_b0(pretrained=training)
-        # Thay BN → GN để hoạt động đúng với batch_size=1
-        net = replace_bn_with_gn(net, num_groups=8)
-        feature_dim = 1280  # output của features[-1] sau GAP
-
-    else:
-        raise ValueError(f"Backbone không hỗ trợ: {backbone}")
-
-    return net, feature_dim
-
-
-class MRNet(nn.Module):
-    """Model đơn giản dùng AlexNet cho một mặt phẳng."""
-    def __init__(self):
+class SliceEncoderEfficientNetB0(nn.Module):
+    def __init__(self, pretrained: bool = True) -> None:
         super().__init__()
-        if hasattr(models, "AlexNet_Weights"):
-            self.model = models.alexnet(weights=models.AlexNet_Weights.DEFAULT)
+        if hasattr(models, "EfficientNet_B0_Weights"):
+            weights = models.EfficientNet_B0_Weights.DEFAULT if pretrained else None
+            backbone = models.efficientnet_b0(weights=weights)
         else:
-            self.model = models.alexnet(pretrained=True)
-        self.gap = nn.AdaptiveAvgPool2d(1)
-        self.classifier = nn.Linear(256, 1)
+            backbone = models.efficientnet_b0(pretrained=pretrained)
 
-    def forward(self, x):
-        x = torch.squeeze(x, dim=0)  # batch_size=1 only
-        x = self.model.features(x)
-        x = self.gap(x).view(x.size(0), -1)
-        x = torch.max(x, 0, keepdim=True)[0]
-        x = self.classifier(x)
+        self.features = backbone.features
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.out_dim = 1280
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.features(x)
+        x = self.pool(x).flatten(1)
         return x
 
 
-class TripleMRNet(nn.Module):
-    """
-    Ba backbone song song (axial / sagittal / coronal), đặc trưng được
-    max-pooled theo chiều slice rồi nối lại cho classifier.
-    """
-    def __init__(self, backbone="efficientnet_b0", training=True):
+class TripleMRNetEfficientNetB0(nn.Module):
+    def __init__(self, pretrained: bool = True, dropout: float = 0.4) -> None:
         super().__init__()
-        self.backbone = backbone
+        self.axial_encoder = SliceEncoderEfficientNetB0(pretrained=pretrained)
+        self.sagittal_encoder = SliceEncoderEfficientNetB0(pretrained=pretrained)
+        self.coronal_encoder = SliceEncoderEfficientNetB0(pretrained=pretrained)
 
-        self.axial_net, feature_dim = _build_backbone(backbone, training)
-        self.sagit_net, _           = _build_backbone(backbone, training)
-        self.coron_net, _           = _build_backbone(backbone, training)
-
-        self.gap_axial = nn.AdaptiveAvgPool2d(1)
-        self.gap_sagit = nn.AdaptiveAvgPool2d(1)
-        self.gap_coron = nn.AdaptiveAvgPool2d(1)
-
-        hidden_dim = 512
+        feature_dim = self.axial_encoder.out_dim
         self.classifier = nn.Sequential(
-            nn.Linear(3 * feature_dim, hidden_dim),
-            SafeBatchNorm1d(hidden_dim),
+            nn.Linear(feature_dim * 3, 512),
             nn.ReLU(inplace=True),
-            nn.Dropout(p=0.4),
-            nn.Linear(hidden_dim, 1),
+            nn.Dropout(dropout),
+            nn.Linear(512, 1),
         )
 
-    def _extract(self, net, vol):
-        """Trích xuất feature từ một volume (nhiều slice)."""
-        if self.backbone == "resnet18":
-            # resnet18 đã bị bỏ FC, output là (B,512,1,1)
-            feat = net(vol).view(vol.size(0), -1)
-        else:
-            # alexnet / efficientnet: dùng .features rồi GAP
-            feat = net.features(vol)
-            if self.backbone == "alexnet":
-                feat = self.gap_axial(feat).view(feat.size(0), -1) \
-                    if net is self.axial_net else \
-                    (self.gap_sagit(feat).view(feat.size(0), -1)
-                     if net is self.sagit_net else
-                     self.gap_coron(feat).view(feat.size(0), -1))
-            else:
-                pool = (self.gap_axial if net is self.axial_net else
-                        self.gap_sagit if net is self.sagit_net else
-                        self.gap_coron)
-                feat = pool(feat).view(feat.size(0), -1)
-        return feat
+    @staticmethod
+    def _to_volume_list(volumes: Union[torch.Tensor, Sequence[torch.Tensor]]) -> List[torch.Tensor]:
+        if isinstance(volumes, torch.Tensor):
+            if volumes.ndim == 4:
+                return [volumes]
+            if volumes.ndim == 5:
+                return [volumes[idx] for idx in range(volumes.shape[0])]
+            raise ValueError(f"Unexpected tensor shape for volume input: {tuple(volumes.shape)}")
+        return list(volumes)
 
-    def forward(self, vol_axial, vol_sagit, vol_coron):
-        vol_axial = torch.squeeze(vol_axial, dim=0)
-        vol_sagit = torch.squeeze(vol_sagit, dim=0)
-        vol_coron = torch.squeeze(vol_coron, dim=0)
+    @staticmethod
+    def _pool_over_slices(slice_features: torch.Tensor) -> torch.Tensor:
+        return torch.max(slice_features, dim=0, keepdim=True).values
 
-        if self.backbone == "resnet18":
-            fa = self.axial_net(vol_axial).view(vol_axial.size(0), -1)
-            fs = self.sagit_net(vol_sagit).view(vol_sagit.size(0), -1)
-            fc = self.coron_net(vol_coron).view(vol_coron.size(0), -1)
-        else:
-            fa = self.gap_axial(self.axial_net.features(vol_axial)).view(vol_axial.size(0), -1)
-            fs = self.gap_sagit(self.sagit_net.features(vol_sagit)).view(vol_sagit.size(0), -1)
-            fc = self.gap_coron(self.coron_net.features(vol_coron)).view(vol_coron.size(0), -1)
+    def _encode_volume(self, volume: torch.Tensor, encoder: nn.Module) -> torch.Tensor:
+        if volume.ndim == 5 and volume.shape[0] == 1:
+            volume = volume.squeeze(0)
+        if volume.ndim != 4:
+            raise ValueError(f"Volume must be [S, 3, H, W], received shape {tuple(volume.shape)}")
+        slice_features = encoder(volume)
+        return self._pool_over_slices(slice_features)
 
-        x = torch.max(fa, 0, keepdim=True)[0]
-        y = torch.max(fs, 0, keepdim=True)[0]
-        z = torch.max(fc, 0, keepdim=True)[0]
+    def forward(
+        self,
+        vol_axial: Union[torch.Tensor, Sequence[torch.Tensor]],
+        vol_sagittal: Union[torch.Tensor, Sequence[torch.Tensor]],
+        vol_coronal: Union[torch.Tensor, Sequence[torch.Tensor]],
+    ) -> torch.Tensor:
+        axial_list = self._to_volume_list(vol_axial)
+        sagittal_list = self._to_volume_list(vol_sagittal)
+        coronal_list = self._to_volume_list(vol_coronal)
 
-        out = self.classifier(torch.cat((x, y, z), dim=1))
-        return out
+        if not (len(axial_list) == len(sagittal_list) == len(coronal_list)):
+            raise ValueError("Batch size mismatch across axial/sagittal/coronal inputs.")
+
+        logits = []
+        for axial_vol, sagittal_vol, coronal_vol in zip(axial_list, sagittal_list, coronal_list):
+            f_axial = self._encode_volume(axial_vol, self.axial_encoder)
+            f_sagittal = self._encode_volume(sagittal_vol, self.sagittal_encoder)
+            f_coronal = self._encode_volume(coronal_vol, self.coronal_encoder)
+            fused = torch.cat([f_axial, f_sagittal, f_coronal], dim=1)
+            logits.append(self.classifier(fused))
+        return torch.cat(logits, dim=0)

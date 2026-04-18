@@ -1,157 +1,183 @@
-import numpy as np
 import os
+from typing import Dict, List, Sequence, Tuple
+
+import numpy as np
 import torch
-import torch.nn.functional as F
-import torch.utils.data as data
+from torch.utils.data import DataLoader, Dataset
 
-from torch.autograd import Variable
-
-INPUT_DIM = 224
-MAX_PIXEL_VAL = 255
-MEAN    = 58.09
-STDDEV  = 49.73
-# ImageNet mean/std theo chuẩn torchvision (ảnh đã scale về [0,1])
-IMAGENET_MEAN = (0.485, 0.456, 0.406)
-IMAGENET_STD  = (0.229, 0.224, 0.225)
+VIEWS = ("axial", "sagittal", "coronal")
+IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(1, 3, 1, 1)
+IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32).reshape(1, 3, 1, 1)
 
 
-def _preprocess_volume(vol, use_imagenet_norm):
-    """
-    Tiền xử lý một volume MRI (shape: [S, H, W]) thành tensor [S, 3, 224, 224].
-
-    Pipeline:
-      1. Crop trung tâm về INPUT_DIM x INPUT_DIM
-      2. Min-max normalize về [0, 1]
-      3a. ImageNet path  (efficientnet): chuẩn hóa theo IMAGENET_MEAN/STD
-      3b. AlexNet path   (alexnet/resnet): nhân 255 → chuẩn hóa theo MEAN/STDDEV
-      4. Stack thành 3 kênh
-    """
-    # 1. Crop
-    pad = int((vol.shape[2] - INPUT_DIM) / 2)
-    if pad > 0:
-        vol = vol[:, pad:-pad, pad:-pad]
-
-    # 2. Min-max → [0, 1]
-    v_min, v_max = vol.min(), vol.max()
-    if v_max > v_min:
-        vol = (vol - v_min) / (v_max - v_min)
-    else:
-        vol = vol * 0.0  # ảnh đồng nhất
-
-    if use_imagenet_norm:
-        # 3a. Stack trước rồi chuẩn hóa theo ImageNet (giá trị đã trong [0,1])
-        vol = np.stack((vol,) * 3, axis=1)          # [S, 3, H, W]
-        mean = np.array(IMAGENET_MEAN)[None, :, None, None]
-        std  = np.array(IMAGENET_STD) [None, :, None, None]
-        vol  = (vol - mean) / std
-    else:
-        # 3b. Scale về [0,255] rồi chuẩn hóa theo thống kê MRNet gốc
-        vol = vol * MAX_PIXEL_VAL
-        vol = (vol - MEAN) / STDDEV
-        vol = np.stack((vol,) * 3, axis=1)          # [S, 3, H, W]
-
-    return vol
+def normalize_case_id(raw_id: str) -> str:
+    base = os.path.splitext(os.path.basename(str(raw_id)))[0]
+    return base.zfill(4)
 
 
-class Dataset(data.Dataset):
-    def __init__(self, data_dir, labels_dir, split, tear_type, use_gpu,
-                 backbone="alexnet"):
-        super().__init__()
-        self.use_gpu = use_gpu
-        self.backbone = backbone
-        self.use_imagenet_norm = backbone.startswith("efficientnet")
-
-        def _norm_id(raw_id):
-            base = os.path.splitext(os.path.basename(str(raw_id)))[0]
-            return base.zfill(4)
-
-        split = split.lower()
-        self.datadir = os.path.join(data_dir, split)
-
-        # --- Đọc nhãn chính ---
-        label_dict = {}
-        label_path = os.path.join(labels_dir, f"{split}-{tear_type}.csv")
-        for line in open(label_path).readlines():
-            parts = line.strip().split(',')
-            label_dict[_norm_id(parts[0])] = int(parts[1])
-
-        # --- Đọc nhãn abnormal (dùng để tính class weight) ---
-        abnormal_label_dict = {}
-        abnormal_path = os.path.join(labels_dir, f"{split}-abnormal.csv")
-        if os.path.exists(abnormal_path):
-            for line in open(abnormal_path).readlines():
-                parts = line.strip().split(',')
-                abnormal_label_dict[_norm_id(parts[0])] = int(parts[1])
-
-        # --- Xây danh sách path theo thứ tự label_dict ---
-        self.paths = [f"{rid}.npy" for rid in label_dict.keys()]
-        rids = [p.split(".")[0] for p in self.paths]
-
-        self.labels = [label_dict[r] for r in rids]
-        if abnormal_label_dict:
-            self.abnormal_labels = [abnormal_label_dict[r] for r in rids]
-        else:
-            self.abnormal_labels = self.labels
-
-        # --- Class weight cho weighted BCE ---
-        if tear_type != "abnormal":
-            temp = [self.labels[i] for i in range(len(self.labels))
-                    if self.abnormal_labels[i] == 1]
-            neg_weight = float(np.mean(temp)) if temp else 0.5
-        else:
-            neg_weight = float(np.mean(self.labels))
-        self.weights = [neg_weight, 1.0 - neg_weight]
-
-    def weighted_loss(self, prediction, target):
-        weights_npy    = np.array([self.weights[int(t[0])] for t in target.data])
-        weights_tensor = torch.FloatTensor(weights_npy)
-        if self.use_gpu:
-            weights_tensor = weights_tensor.cuda()
-        return F.binary_cross_entropy_with_logits(
-            prediction, target, weight=Variable(weights_tensor))
-
-    def __getitem__(self, index):
-        filename = self.paths[index]
-        vol_axial = np.load(os.path.join(self.datadir, "axial",     filename))
-        vol_sagit = np.load(os.path.join(self.datadir, "sagittal",  filename))
-        vol_coron = np.load(os.path.join(self.datadir, "coronal",   filename))
-
-        vol_axial = _preprocess_volume(vol_axial, self.use_imagenet_norm)
-        vol_sagit = _preprocess_volume(vol_sagit, self.use_imagenet_norm)
-        vol_coron = _preprocess_volume(vol_coron, self.use_imagenet_norm)
-
-        label_tensor = torch.FloatTensor([self.labels[index]])
-
-        return (torch.FloatTensor(vol_axial),
-                torch.FloatTensor(vol_sagit),
-                torch.FloatTensor(vol_coron),
-                label_tensor,
-                self.abnormal_labels[index])
-
-    def __len__(self):
-        return len(self.paths)
+def read_label_csv(path: str) -> Dict[str, int]:
+    labels: Dict[str, int] = {}
+    with open(path, "r", encoding="utf-8") as file:
+        for line in file:
+            line = line.strip()
+            if not line:
+                continue
+            sample_id, target = line.split(",")
+            labels[normalize_case_id(sample_id)] = int(target)
+    return labels
 
 
-def load_data(task="acl", use_gpu=False, data_dir="data", labels_dir="labels",
-              num_workers=4, backbone="alexnet"):
-    pin_memory = bool(use_gpu)
-    max_workers = os.cpu_count() or 1
-    num_workers = max(0, min(num_workers, max_workers, 4))
+def center_crop_or_pad(volume: np.ndarray, out_size: int) -> np.ndarray:
+    _, height, width = volume.shape
+    top = max((height - out_size) // 2, 0)
+    left = max((width - out_size) // 2, 0)
+    cropped = volume[:, top:top + min(height, out_size), left:left + min(width, out_size)]
 
-    train_dataset = Dataset(data_dir, labels_dir, "train", task, use_gpu, backbone)
-    valid_dataset = Dataset(data_dir, labels_dir, "valid", task, use_gpu, backbone)
-    test_dataset  = Dataset(data_dir, labels_dir, "test",  task, use_gpu, backbone)
-
-    def _make_loader(dataset, shuffle):
-        return data.DataLoader(
-            dataset,
-            batch_size=1,
-            num_workers=num_workers,
-            shuffle=shuffle,
-            pin_memory=pin_memory,
-            persistent_workers=(num_workers > 0 and shuffle),
+    pad_h = out_size - cropped.shape[1]
+    pad_w = out_size - cropped.shape[2]
+    if pad_h > 0 or pad_w > 0:
+        pad_top = pad_h // 2
+        pad_bottom = pad_h - pad_top
+        pad_left = pad_w // 2
+        pad_right = pad_w - pad_left
+        cropped = np.pad(
+            cropped,
+            ((0, 0), (pad_top, pad_bottom), (pad_left, pad_right)),
+            mode="constant",
+            constant_values=0.0,
         )
+    return cropped
 
-    return (_make_loader(train_dataset, shuffle=True),
-            _make_loader(valid_dataset, shuffle=False),
-            _make_loader(test_dataset,  shuffle=False))
+
+def preprocess_volume(volume: np.ndarray, image_size: int) -> np.ndarray:
+    volume = volume.astype(np.float32)
+    volume = center_crop_or_pad(volume=volume, out_size=image_size)
+
+    vol_min = float(volume.min())
+    vol_max = float(volume.max())
+    if vol_max > vol_min:
+        volume = (volume - vol_min) / (vol_max - vol_min)
+    else:
+        volume = np.zeros_like(volume, dtype=np.float32)
+
+    volume = np.stack([volume, volume, volume], axis=1)
+    volume = (volume - IMAGENET_MEAN) / IMAGENET_STD
+    return volume.astype(np.float32)
+
+
+class MRNetDataset(Dataset):
+    def __init__(
+        self,
+        data_dir: str,
+        labels_dir: str,
+        split: str,
+        task: str,
+        image_size: int = 224,
+    ) -> None:
+        self.split = split
+        self.task = task
+        self.image_size = image_size
+        self.data_dir = os.path.join(data_dir, split)
+
+        label_path = os.path.join(labels_dir, f"{split}-{task}.csv")
+        if not os.path.exists(label_path):
+            raise FileNotFoundError(f"Missing label file: {label_path}")
+
+        label_map = read_label_csv(label_path)
+        valid_ids: List[str] = []
+        for case_id in label_map:
+            has_all_views = all(
+                os.path.exists(os.path.join(self.data_dir, view, f"{case_id}.npy"))
+                for view in VIEWS
+            )
+            if has_all_views:
+                valid_ids.append(case_id)
+
+        if not valid_ids:
+            raise RuntimeError(
+                f"No valid samples for split={split}, task={task}. Checked directory: {self.data_dir}"
+            )
+
+        self.case_ids = sorted(valid_ids)
+        self.labels = [label_map[case_id] for case_id in self.case_ids]
+
+    def __len__(self) -> int:
+        return len(self.case_ids)
+
+    def __getitem__(self, index: int):
+        case_id = self.case_ids[index]
+        volumes = []
+        for view in VIEWS:
+            volume_path = os.path.join(self.data_dir, view, f"{case_id}.npy")
+            volume = np.load(volume_path)
+            volume = preprocess_volume(volume=volume, image_size=self.image_size)
+            volumes.append(torch.from_numpy(volume))
+
+        label = torch.tensor([float(self.labels[index])], dtype=torch.float32)
+        return volumes[0], volumes[1], volumes[2], label, case_id
+
+
+def mrnet_collate_fn(batch):
+    axial_batch = [item[0] for item in batch]
+    sagittal_batch = [item[1] for item in batch]
+    coronal_batch = [item[2] for item in batch]
+    labels = torch.cat([item[3] for item in batch], dim=0).view(-1, 1)
+    case_ids = [item[4] for item in batch]
+    return axial_batch, sagittal_batch, coronal_batch, labels, case_ids
+
+
+def compute_pos_weight(labels: Sequence[int]) -> torch.Tensor:
+    positives = float(sum(labels))
+    negatives = float(len(labels) - positives)
+    if positives <= 0:
+        return torch.tensor([1.0], dtype=torch.float32)
+    return torch.tensor([max(negatives / positives, 1e-6)], dtype=torch.float32)
+
+
+def create_loaders(
+    task: str,
+    data_dir: str,
+    labels_dir: str,
+    image_size: int,
+    batch_size: int,
+    num_workers: int,
+    pin_memory: bool,
+) -> Tuple[DataLoader, DataLoader]:
+    train_set = MRNetDataset(
+        data_dir=data_dir,
+        labels_dir=labels_dir,
+        split="train",
+        task=task,
+        image_size=image_size,
+    )
+    valid_set = MRNetDataset(
+        data_dir=data_dir,
+        labels_dir=labels_dir,
+        split="valid",
+        task=task,
+        image_size=image_size,
+    )
+
+    max_workers = os.cpu_count() or 1
+    workers = max(0, min(num_workers, max_workers))
+    persistent_workers = workers > 0
+
+    train_loader = DataLoader(
+        train_set,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=workers,
+        pin_memory=pin_memory,
+        persistent_workers=persistent_workers,
+        collate_fn=mrnet_collate_fn,
+    )
+    valid_loader = DataLoader(
+        valid_set,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=workers,
+        pin_memory=pin_memory,
+        persistent_workers=persistent_workers,
+        collate_fn=mrnet_collate_fn,
+    )
+    return train_loader, valid_loader
