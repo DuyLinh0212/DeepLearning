@@ -27,42 +27,33 @@ def read_label_csv(path: str) -> Dict[str, int]:
     return labels
 
 
-def center_crop_or_pad(volume: np.ndarray, out_size: int) -> np.ndarray:
-    _, height, width = volume.shape
-    top = max((height - out_size) // 2, 0)
-    left = max((width - out_size) // 2, 0)
-    cropped = volume[:, top:top + min(height, out_size), left:left + min(width, out_size)]
-
-    pad_h = out_size - cropped.shape[1]
-    pad_w = out_size - cropped.shape[2]
-    if pad_h > 0 or pad_w > 0:
-        pad_top = pad_h // 2
-        pad_bottom = pad_h - pad_top
-        pad_left = pad_w // 2
-        pad_right = pad_w - pad_left
-        cropped = np.pad(
-            cropped,
-            ((0, 0), (pad_top, pad_bottom), (pad_left, pad_right)),
-            mode="constant",
-            constant_values=0.0,
-        )
-    return cropped
+def match_target_slices(volume: np.ndarray, target_slices: int) -> np.ndarray:
+    if target_slices <= 0:
+        return volume
+    current = volume.shape[0]
+    if current == target_slices:
+        return volume
+    if current > target_slices:
+        return volume[:target_slices]
+    pad_count = target_slices - current
+    pad = np.zeros((pad_count, volume.shape[1], volume.shape[2]), dtype=volume.dtype)
+    return np.concatenate([volume, pad], axis=0)
 
 
-def preprocess_volume(volume: np.ndarray, image_size: int) -> np.ndarray:
-    volume = volume.astype(np.float32)
-    volume = center_crop_or_pad(volume=volume, out_size=image_size)
+def to_three_channel(volume: np.ndarray) -> np.ndarray:
+    # Keep baseline loading simple: only convert grayscale [S,H,W] -> [S,3,H,W].
+    return np.stack([volume, volume, volume], axis=1).astype(np.float32)
 
-    vol_min = float(volume.min())
-    vol_max = float(volume.max())
-    if vol_max > vol_min:
-        volume = (volume - vol_min) / (vol_max - vol_min)
+
+def normalize_imagenet(volume_3ch: np.ndarray) -> np.ndarray:
+    vmin = float(volume_3ch.min())
+    vmax = float(volume_3ch.max())
+    if vmax > vmin:
+        volume_3ch = (volume_3ch - vmin) / (vmax - vmin)
     else:
-        volume = np.zeros_like(volume, dtype=np.float32)
-
-    volume = np.stack([volume, volume, volume], axis=1)
-    volume = (volume - IMAGENET_MEAN) / IMAGENET_STD
-    return volume.astype(np.float32)
+        volume_3ch = np.zeros_like(volume_3ch, dtype=np.float32)
+    volume_3ch = (volume_3ch - IMAGENET_MEAN) / IMAGENET_STD
+    return volume_3ch.astype(np.float32)
 
 
 class MRNetDataset(Dataset):
@@ -72,11 +63,11 @@ class MRNetDataset(Dataset):
         labels_dir: str,
         split: str,
         task: str,
-        image_size: int = 224,
+        target_slices: int = 32,
     ) -> None:
         self.split = split
         self.task = task
-        self.image_size = image_size
+        self.target_slices = target_slices
         self.data_dir = os.path.join(data_dir, split)
 
         label_path = os.path.join(labels_dir, f"{split}-{task}.csv")
@@ -109,8 +100,10 @@ class MRNetDataset(Dataset):
         volumes = []
         for view in VIEWS:
             volume_path = os.path.join(self.data_dir, view, f"{case_id}.npy")
-            volume = np.load(volume_path)
-            volume = preprocess_volume(volume=volume, image_size=self.image_size)
+            volume = np.load(volume_path).astype(np.float32)
+            volume = match_target_slices(volume=volume, target_slices=self.target_slices)
+            volume = to_three_channel(volume)
+            volume = normalize_imagenet(volume)
             volumes.append(torch.from_numpy(volume))
 
         label = torch.tensor([float(self.labels[index])], dtype=torch.float32)
@@ -138,24 +131,24 @@ def create_loaders(
     task: str,
     data_dir: str,
     labels_dir: str,
-    image_size: int,
     batch_size: int,
     num_workers: int,
     pin_memory: bool,
+    target_slices: int,
 ) -> Tuple[DataLoader, DataLoader]:
     train_set = MRNetDataset(
         data_dir=data_dir,
         labels_dir=labels_dir,
         split="train",
         task=task,
-        image_size=image_size,
+        target_slices=target_slices,
     )
     valid_set = MRNetDataset(
         data_dir=data_dir,
         labels_dir=labels_dir,
         split="valid",
         task=task,
-        image_size=image_size,
+        target_slices=target_slices,
     )
 
     max_workers = os.cpu_count() or 1
