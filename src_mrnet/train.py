@@ -9,6 +9,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 import numpy as np
 import torch
 from torch import nn
+from tqdm import tqdm
 
 from src_mrnet.config import TrainConfig, build_config, config_to_dict
 from src_mrnet.loader import compute_pos_weight, create_loaders
@@ -72,7 +73,13 @@ def run_one_epoch(
     all_labels: List[int] = []
     all_probs: List[float] = []
 
-    for step, (vol_axial, vol_sagittal, vol_coronal, labels, _) in enumerate(loader, start=1):
+    progress = tqdm(
+        loader,
+        desc=f"{mode} {epoch_idx + 1}/{total_epochs}",
+        dynamic_ncols=True,
+        leave=False,
+    )
+    for step, (vol_axial, vol_sagittal, vol_coronal, labels, _) in enumerate(progress, start=1):
         axial_batch = move_volume_batch_to_device(vol_axial, device)
         sagittal_batch = move_volume_batch_to_device(vol_sagittal, device)
         coronal_batch = move_volume_batch_to_device(vol_coronal, device)
@@ -97,6 +104,7 @@ def run_one_epoch(
 
         if log_interval > 0 and (step % log_interval == 0 or step == len(loader)):
             avg_loss = float(np.mean(losses))
+            progress.set_postfix(loss=f"{avg_loss:.4f}")
             logger.info(
                 "[%s] Epoch %d/%d | Step %d/%d | Loss %.4f",
                 mode,
@@ -195,6 +203,7 @@ def train(config: TrainConfig) -> None:
         num_workers=config.num_workers,
         pin_memory=(device.type == "cuda"),
         target_slices=config.target_slices,
+        image_size=config.image_size,
     )
     logger.info("Dataset loaded: train=%d | valid=%d", len(train_loader.dataset), len(valid_loader.dataset))
 

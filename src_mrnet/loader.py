@@ -4,6 +4,8 @@ from typing import Dict, List, Sequence, Tuple
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
+from preprocessing.resize import resize_volume_bilinear
+from preprocessing.slice_sampling import uniform_slice_sampling
 
 VIEWS = ("axial", "sagittal", "coronal")
 IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(1, 3, 1, 1)
@@ -25,19 +27,6 @@ def read_label_csv(path: str) -> Dict[str, int]:
             sample_id, target = line.split(",")
             labels[normalize_case_id(sample_id)] = int(target)
     return labels
-
-
-def match_target_slices(volume: np.ndarray, target_slices: int) -> np.ndarray:
-    if target_slices <= 0:
-        return volume
-    current = volume.shape[0]
-    if current == target_slices:
-        return volume
-    if current > target_slices:
-        return volume[:target_slices]
-    pad_count = target_slices - current
-    pad = np.zeros((pad_count, volume.shape[1], volume.shape[2]), dtype=volume.dtype)
-    return np.concatenate([volume, pad], axis=0)
 
 
 def to_three_channel(volume: np.ndarray) -> np.ndarray:
@@ -64,10 +53,12 @@ class MRNetDataset(Dataset):
         split: str,
         task: str,
         target_slices: int = 32,
+        image_size: int = 224,
     ) -> None:
         self.split = split
         self.task = task
         self.target_slices = target_slices
+        self.image_size = image_size
         self.data_dir = os.path.join(data_dir, split)
 
         label_path = os.path.join(labels_dir, f"{split}-{task}.csv")
@@ -101,7 +92,8 @@ class MRNetDataset(Dataset):
         for view in VIEWS:
             volume_path = os.path.join(self.data_dir, view, f"{case_id}.npy")
             volume = np.load(volume_path).astype(np.float32)
-            volume = match_target_slices(volume=volume, target_slices=self.target_slices)
+            volume = uniform_slice_sampling(volume=volume, target_slices=self.target_slices)
+            volume = resize_volume_bilinear(volume=volume, target_size=self.image_size)
             volume = to_three_channel(volume)
             volume = normalize_imagenet(volume)
             volumes.append(torch.from_numpy(volume))
@@ -135,6 +127,7 @@ def create_loaders(
     num_workers: int,
     pin_memory: bool,
     target_slices: int,
+    image_size: int,
 ) -> Tuple[DataLoader, DataLoader]:
     train_set = MRNetDataset(
         data_dir=data_dir,
@@ -142,6 +135,7 @@ def create_loaders(
         split="train",
         task=task,
         target_slices=target_slices,
+        image_size=image_size,
     )
     valid_set = MRNetDataset(
         data_dir=data_dir,
@@ -149,6 +143,7 @@ def create_loaders(
         split="valid",
         task=task,
         target_slices=target_slices,
+        image_size=image_size,
     )
 
     max_workers = os.cpu_count() or 1
