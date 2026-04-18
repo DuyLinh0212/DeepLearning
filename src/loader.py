@@ -1,11 +1,8 @@
 import numpy as np
 import os
-import pickle
 import torch
 import torch.nn.functional as F
 import torch.utils.data as data
-
-import pdb
 
 from torch.autograd import Variable
 
@@ -15,7 +12,7 @@ MEAN = 58.09
 STDDEV = 49.73
 
 class Dataset(data.Dataset):
-    def __init__(self, datadir, tear_type, use_gpu):
+    def __init__(self, datadir, tear_type, use_gpu, labels_dir=None):
         super().__init__()
         self.use_gpu = use_gpu
 
@@ -27,13 +24,15 @@ class Dataset(data.Dataset):
             datadir = datadir[:-1]
         self.datadir = datadir
 
-        for i, line in enumerate(open(datadir+'-'+tear_type+'.csv').readlines()):
+        label_root = labels_dir if labels_dir is not None else datadir
+
+        for i, line in enumerate(open(label_root + '-' + tear_type + '.csv').readlines()):
             line = line.strip().split(',')
             filename = line[0]
             label = line[1]
             label_dict[filename] = int(label)
 
-        for i, line in enumerate(open(datadir+'-'+"abnormal"+'.csv').readlines()):
+        for i, line in enumerate(open(label_root + '-' + "abnormal" + '.csv').readlines()):
             line = line.strip().split(',')
             filename = line[0]
             label = line[1]
@@ -48,9 +47,9 @@ class Dataset(data.Dataset):
 
         if tear_type != "abnormal":
             temp_labels = [self.labels[i] for i in range(len(self.labels)) if self.abnormal_labels[i]==1]
-            neg_weight = np.mean(temp_labels)
+            neg_weight = float(np.mean(temp_labels)) if temp_labels else 0.5
         else:
-            neg_weight = np.mean(self.labels)
+            neg_weight = float(np.mean(self.labels)) if self.labels else 0.5
         
         self.weights = [neg_weight, 1 - neg_weight]
 
@@ -99,39 +98,34 @@ class Dataset(data.Dataset):
     def __len__(self):
         return len(self.paths)
 
-def load_data(task="acl", use_gpu=False, num_workers=8):
-    train_dir = "data/train"
-    valid_dir = "data/valid"
-    test_dir = "data/test"
+def load_data(task="acl", use_gpu=False, data_dir="data", labels_dir=None, num_workers=4):
+    train_dir = os.path.join(data_dir, "train")
+    valid_dir = os.path.join(data_dir, "valid")
+    labels_train = None if labels_dir is None else os.path.join(labels_dir, "train")
+    labels_valid = None if labels_dir is None else os.path.join(labels_dir, "valid")
     
-    train_dataset = Dataset(train_dir, task, use_gpu)
-    valid_dataset = Dataset(valid_dir, task, use_gpu)
-    test_dataset = Dataset(test_dir, task, use_gpu)
+    train_dataset = Dataset(train_dir, task, use_gpu, labels_dir=labels_train)
+    valid_dataset = Dataset(valid_dir, task, use_gpu, labels_dir=labels_valid)
 
+    max_workers = os.cpu_count() or 1
+    workers = max(0, min(num_workers, max_workers))
     pin_memory = bool(use_gpu)
+
     train_loader = data.DataLoader(
         train_dataset,
         batch_size=1,
-        num_workers=num_workers,
+        num_workers=workers,
         shuffle=True,
         pin_memory=pin_memory,
-        persistent_workers=num_workers > 0,
+        persistent_workers=(workers > 0),
     )
     valid_loader = data.DataLoader(
         valid_dataset,
         batch_size=1,
-        num_workers=num_workers,
+        num_workers=workers,
         shuffle=False,
         pin_memory=pin_memory,
-        persistent_workers=num_workers > 0,
-    )
-    test_loader = data.DataLoader(
-        test_dataset,
-        batch_size=1,
-        num_workers=num_workers,
-        shuffle=False,
-        pin_memory=pin_memory,
-        persistent_workers=num_workers > 0,
+        persistent_workers=(workers > 0),
     )
 
-    return train_loader, valid_loader, test_loader
+    return train_loader, valid_loader
