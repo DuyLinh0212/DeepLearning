@@ -68,7 +68,7 @@ def train(
     abnormal_model_path=None,
     data_dir="data",
     labels_dir="labels",
-    num_workers=8,
+    num_workers=4,
     use_amp=False,
     checkpoint_every=1,
 ):
@@ -81,8 +81,11 @@ def train(
     )
 
     if abnormal_model_path and not os.path.isfile(abnormal_model_path):
-        raise FileNotFoundError(
-            f"abnormal_model_path not found: {abnormal_model_path}")
+        print(
+            f"[Warning] abnormal_model_path not found: {abnormal_model_path}. "
+            "Disable abnormal gate and continue training/evaluation."
+        )
+        abnormal_model_path = None
 
     model = TripleMRNet(backbone=backbone)
     if use_gpu:
@@ -151,6 +154,8 @@ def train(
             use_amp=use_amp, scaler=scaler,
         )
         print(f"  train loss: {train_loss:.4f}  train AUC: {train_auc:.4f}")
+        if use_gpu:
+            torch.cuda.empty_cache()
 
         val_loss, val_auc, _, _ = run_model(
             model, valid_loader,
@@ -192,6 +197,8 @@ def train(
                                 map_location=(None if use_gpu else 'cpu'))
         model.load_state_dict(best_state)
     model.eval()
+    if use_gpu:
+        torch.cuda.empty_cache()
 
     test_loss, test_auc, preds, labels = run_model(
         model, test_loader,
@@ -220,7 +227,7 @@ def get_parser():
     parser.add_argument('--epochs',      type=int,   default=50)
     parser.add_argument('--backbone',    type=str,   default="efficientnet_b0")
     parser.add_argument('--abnormal_model', type=str, default=None)
-    parser.add_argument('--num_workers', type=int,   default=8)
+    parser.add_argument('--num_workers', type=int,   default=4)
     parser.add_argument('--amp',         action='store_true')
     parser.add_argument('--checkpoint_every', type=int, default=1)
     return parser
@@ -254,6 +261,6 @@ if __name__ == '__main__':
         data_dir=args.data_dir,
         labels_dir=args.labels_dir,
         num_workers=args.num_workers,
-        use_amp=(args.gpu or args.amp),
+        use_amp=(args.gpu and args.amp),
         checkpoint_every=args.checkpoint_every,
     )

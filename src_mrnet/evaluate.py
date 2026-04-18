@@ -13,7 +13,7 @@ from sklearn import metrics
 from torch.autograd import Variable
 
 from loader import load_data
-from model import TripleMRNet
+from model import TripleMRNet # Bạn nhớ đảm bảo load đúng model nhé
 
 def get_parser():
     parser = argparse.ArgumentParser()
@@ -28,14 +28,16 @@ def run_model(model, loader, train=False, optimizer=None,
     preds = []
     labels = []
 
+    device = next(model.parameters()).device
+
     if train:
         model.train()
     else:
         if abnormal_model_path:
             abnormal_model = TripleMRNet(backbone=model.backbone)
-            state_dict = torch.load(abnormal_model_path)
+            state_dict = torch.load(abnormal_model_path, map_location=device)
             abnormal_model.load_state_dict(state_dict)
-            abnormal_model.cuda()
+            abnormal_model.to(device)
             abnormal_model.eval()
         model.eval()
 
@@ -56,13 +58,15 @@ def run_model(model, loader, train=False, optimizer=None,
         vol_axial, vol_sagit, vol_coron = Variable(vol_axial), Variable(vol_sagit), Variable(vol_coron)
         label = Variable(label)
 
-        if use_amp:
-            with torch.cuda.amp.autocast():
-                logit = model.forward(vol_axial, vol_sagit, vol_coron)
+        # Eval must not build autograd graph, otherwise VRAM grows and causes OOM.
+        with torch.set_grad_enabled(train):
+            if use_amp:
+                with torch.cuda.amp.autocast():
+                    logit = model(vol_axial, vol_sagit, vol_coron)
+                    loss = loader.dataset.weighted_loss(logit, label)
+            else:
+                logit = model(vol_axial, vol_sagit, vol_coron)
                 loss = loader.dataset.weighted_loss(logit, label)
-        else:
-            logit = model.forward(vol_axial, vol_sagit, vol_coron)
-            loss = loader.dataset.weighted_loss(logit, label)
         total_loss += loss.item()
 
         pred = torch.sigmoid(logit)
@@ -70,7 +74,8 @@ def run_model(model, loader, train=False, optimizer=None,
         pred_npy = pred.data.cpu().numpy()[0][0]
 
         if abnormal_model_path and not train:
-            abnormal_logit = abnormal_model.forward(
+            with torch.no_grad():
+                abnormal_logit = abnormal_model(
                     vol_axial,
                     vol_sagit,
                     vol_coron)
@@ -87,14 +92,31 @@ def run_model(model, loader, train=False, optimizer=None,
             if use_amp:
                 if scaler is None:
                     raise ValueError("AMP enabled but GradScaler is None")
+                
+                # 1. Tính đạo hàm ở chuẩn FP16
                 scaler.scale(loss).backward()
+                
+                # 2. Giải nén (unscale) đạo hàm về giá trị thực trước khi cắt
+                scaler.unscale_(optimizer)
+                
+                # 3. CẮT GỌT ĐẠO HÀM (Gradient Clipping) chặn Overflow
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                
+                # 4. Cập nhật trọng số
                 scaler.step(optimizer)
                 scaler.update()
             else:
                 loss.backward()
+                
+                # Áp dụng Gradient Clipping cho cả chế độ thường (rất tốt để chống văng loss)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                
                 optimizer.step()
         num_batches += 1
 
+    if num_batches == 0:
+        raise RuntimeError(
+            "No batches were processed. Check abnormal filtering and dataset labels.")
     avg_loss = total_loss / num_batches
     
     fpr, tpr, threshold = metrics.roc_curve(labels, preds)
@@ -108,7 +130,10 @@ def run_model(model, loader, train=False, optimizer=None,
 def evaluate(split, model_path, diagnosis, use_gpu, num_workers=8):
     train_loader, valid_loader, test_loader = load_data(diagnosis, use_gpu, num_workers=num_workers)
 
-    model = MRNet()
+    # Chú ý: Đảm bảo bạn dùng đúng class model ở đây. Trong code gốc bạn đang gọi MRNet()
+    # Mình đổi thành TripleMRNet() (mặc định backbone) để khớp với context bài toán nhé.
+    # Nếu file test của bạn dùng model khác thì nhớ sửa lại.
+    model = TripleMRNet() 
     state_dict = torch.load(model_path, map_location=(None if use_gpu else 'cpu'))
     model.load_state_dict(state_dict)
 

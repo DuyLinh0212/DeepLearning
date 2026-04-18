@@ -133,8 +133,10 @@ class Dataset(data.Dataset):
 
 
 def load_data(task="acl", use_gpu=False, data_dir="data", labels_dir="labels",
-              num_workers=8, backbone="alexnet"):
+              num_workers=4, backbone="alexnet"):
     pin_memory = bool(use_gpu)
+    max_workers = os.cpu_count() or 1
+    num_workers = max(0, min(num_workers, max_workers, 4))
 
     train_dataset = Dataset(data_dir, labels_dir, "train", task, use_gpu, backbone)
     valid_dataset = Dataset(data_dir, labels_dir, "valid", task, use_gpu, backbone)
@@ -147,7 +149,7 @@ def load_data(task="acl", use_gpu=False, data_dir="data", labels_dir="labels",
             num_workers=num_workers,
             shuffle=shuffle,
             pin_memory=pin_memory,
-            persistent_workers=(num_workers > 0),
+            persistent_workers=(num_workers > 0 and shuffle),
         )
 
     return (_make_loader(train_dataset, shuffle=True),
