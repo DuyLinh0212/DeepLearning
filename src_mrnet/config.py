@@ -17,7 +17,7 @@ class TrainConfig:
     num_workers: int = 4
     image_size: int = 224
     learning_rate: float = 1e-4
-    backbone_lr_mult: float = 0.2
+    backbone_lr_mult: float = 0.5
     weight_decay: float = 1e-4
     dropout: float = 0.4
     projected_dim: int = 256

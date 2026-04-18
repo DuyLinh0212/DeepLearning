@@ -2,7 +2,24 @@ from typing import List, Sequence, Union
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torchvision import models
+
+
+class SafeBatchNorm1d(nn.BatchNorm1d):
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        if self.training and input.ndim >= 2 and input.shape[0] < 2:
+            return F.batch_norm(
+                input,
+                self.running_mean,
+                self.running_var,
+                self.weight,
+                self.bias,
+                training=False,
+                momentum=self.momentum,
+                eps=self.eps,
+            )
+        return super().forward(input)
 
 
 class SliceEncoderEfficientNetB0(nn.Module):
@@ -16,12 +33,14 @@ class SliceEncoderEfficientNetB0(nn.Module):
 
         self.features = backbone.features
         self.pool = nn.AdaptiveAvgPool2d(1)
+        self.bn = SafeBatchNorm1d(1280)
         self.feature_projection = nn.Linear(1280, projected_dim)
         self.out_dim = projected_dim
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.features(x)
         x = self.pool(x).flatten(1)
+        x = self.bn(x)
         x = self.feature_projection(x)
         return x
 
@@ -37,8 +56,12 @@ class TripleMRNetEfficientNetB0(nn.Module):
         feature_dim = self.axial_encoder.out_dim
         self.classifier = nn.Sequential(
             nn.Linear(feature_dim * 3, 512),
+            SafeBatchNorm1d(512),
             nn.ReLU(inplace=True),
-            nn.Linear(512, 1),
+            nn.Dropout(dropout),
+            nn.Linear(512, 256),
+            nn.ReLU(inplace=True),
+            nn.Linear(256, 1),
         )
 
     @staticmethod

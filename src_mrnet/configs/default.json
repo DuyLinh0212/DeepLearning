@@ -10,7 +10,7 @@
   "num_workers": 4,
   "image_size": 224,
   "learning_rate": 0.0001,
-  "backbone_lr_mult": 0.2,
+  "backbone_lr_mult": 0.5,
   "weight_decay": 0.0001,
   "dropout": 0.4,
   "projected_dim": 256,
