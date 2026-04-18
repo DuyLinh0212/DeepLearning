@@ -1,6 +1,28 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torchvision import models
+
+
+class SafeBatchNorm1d(nn.BatchNorm1d):
+    """
+    BatchNorm1d an toàn cho batch_size=1.
+    Khi train mà batch chỉ có 1 sample, dùng running stats thay vì batch stats
+    để tránh lỗi/dao động.
+    """
+    def forward(self, input):
+        if self.training and input.dim() == 2 and input.size(0) == 1:
+            return F.batch_norm(
+                input,
+                self.running_mean,
+                self.running_var,
+                self.weight,
+                self.bias,
+                False,
+                self.momentum,
+                self.eps,
+            )
+        return super().forward(input)
 
 
 def replace_bn_with_gn(model, num_groups=8):
@@ -106,7 +128,14 @@ class TripleMRNet(nn.Module):
         self.gap_sagit = nn.AdaptiveAvgPool2d(1)
         self.gap_coron = nn.AdaptiveAvgPool2d(1)
 
-        self.classifier = nn.Linear(3 * feature_dim, 1)
+        hidden_dim = 512
+        self.classifier = nn.Sequential(
+            nn.Linear(3 * feature_dim, hidden_dim),
+            SafeBatchNorm1d(hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=0.4),
+            nn.Linear(hidden_dim, 1),
+        )
 
     def _extract(self, net, vol):
         """Trích xuất feature từ một volume (nhiều slice)."""
