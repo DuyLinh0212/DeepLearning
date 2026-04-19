@@ -22,56 +22,56 @@ def _evaluate_model(model, val_loader, criterion, epoch, num_epochs, writer, cur
     # List of losses obtained
     losses = []
 
-    # Iterate over the validation dataset
-    for i, batch in enumerate(val_loader):
-        if batch is None:
-            continue
-        images, label = batch
-        # If GPU is available, load the images and label
-        # on GPU
-        if torch.cuda.is_available():
-            images = [image.cuda() for image in images]
-            label = label.cuda()
+    # Disable gradient tracking during validation to reduce GPU memory usage.
+    with torch.no_grad():
+        # Iterate over the validation dataset
+        for i, batch in enumerate(val_loader):
+            if batch is None:
+                continue
+            images, label = batch
+            # If GPU is available, load the images and label
+            # on GPU
+            if torch.cuda.is_available():
+                images = [image.cuda() for image in images]
+                label = label.cuda()
 
-        # Obtain the model output by passing the images as input
-        output = model(images)
-        # Evaluate the loss by comparing the output and groundtruth label
-        loss = criterion(output, label)
-        # Add loss to the list of losses
-        loss_value = loss.item()
-        losses.append(loss_value)
-        # Find probability for each class by applying
-        # sigmoid function on model output
-        probas = torch.sigmoid(output)
-        # Add the groundtruth to the list of groundtruths
-        y_gt.append(int(label.item()))
-        # Add predicted probability to the list
-        y_probs.append(probas.item())
+            # Obtain the model output by passing the images as input
+            output = model(images)
+            # Evaluate the loss by comparing the output and groundtruth label
+            loss = criterion(output, label)
+            # Add loss to the list of losses
+            loss_value = loss.item()
+            losses.append(loss_value)
+            # Find probability for each class by applying
+            # sigmoid function on model output
+            probas = torch.sigmoid(output)
+            # Add the groundtruth to the list of groundtruths
+            y_gt.append(int(label.item()))
+            # Add predicted probability to the list
+            y_probs.append(probas.item())
 
-        try:
-            # Evaluate area under ROC curve based on the groundtruth label
-            # and predicted probability
-            auc = metrics.roc_auc_score(y_gt, y_probs)
-        except:
-            # Default area under ROC curve
-            auc = 0.5
-        # Add information to the writer about validation loss and Area under ROC curve
-        writer.add_scalar('Val/Loss', loss_value, epoch * len(val_loader) + i)
-        writer.add_scalar('Val/AUC', auc, epoch * len(val_loader) + i)
+            # ROC-AUC is undefined when only one class is present.
+            if len(set(y_gt)) >= 2:
+                auc = metrics.roc_auc_score(y_gt, y_probs)
+            else:
+                auc = 0.5
+            # Add information to the writer about validation loss and Area under ROC curve
+            writer.add_scalar('Val/Loss', loss_value, epoch * len(val_loader) + i)
+            writer.add_scalar('Val/AUC', auc, epoch * len(val_loader) + i)
 
-        if (i % log_every == 0) & (i > 0):
-            # Display the information about average validation loss and area under ROC curve
-            print('''[Epoch: {0} / {1} | Batch : {2} / {3} ]| Avg Val Loss {4} | Val AUC : {5} | lr : {6}'''.
-                  format(
-                      epoch + 1,
-                      num_epochs,
-                      i,
-                      len(val_loader),
-                      np.round(np.mean(losses), 4),
-                      np.round(auc, 4),
-                      current_lr
-                  )
-                  )
+            if (i % log_every == 0) & (i > 0):
+                # Display the information about average validation loss and area under ROC curve
+                print('''[Epoch: {0} / {1} | Batch : {2} / {3} ]| Avg Val Loss {4} | Val AUC : {5} | lr : {6}'''.
+                      format(
+                          epoch + 1,
+                          num_epochs,
+                          i,
+                          len(val_loader),
+                          np.round(np.mean(losses), 4),
+                          np.round(auc, 4),
+                          current_lr
+                      )
+                      )
     # Add information to the writer about total epochs and Area under ROC curve
     writer.add_scalar('Val/AUC_epoch', auc, epoch + i)
     # Find mean area under ROC curve and validation loss

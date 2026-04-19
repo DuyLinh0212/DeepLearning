@@ -13,7 +13,7 @@ config = {
     # Colab-friendly defaults to reduce GPU memory
     'image_size' : 224,
     'target_slices' : 32,
-    'num_workers' : 8,
+    'num_workers' : 4,
     'backbone_lr_mult' : 0.1,
     'clip_grad_norm' : 1.0
     ,

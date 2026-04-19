@@ -13,7 +13,12 @@ from tqdm import tqdm
 
 from src_mrnet.config import TrainConfig, build_config, config_to_dict
 from src_mrnet.loader import compute_pos_weight, create_loaders
-from src_mrnet.metrics import compute_binary_metrics
+from src_mrnet.metrics import (
+    compute_binary_metrics,
+    save_confusion_matrix,
+    save_roc_curve,
+    save_training_curves,
+)
 from src_mrnet.model import TripleMRNetEfficientNetB0
 
 
@@ -178,7 +183,9 @@ def _log_table_row(
 def train(config: TrainConfig) -> None:
     run_dir = Path("runs") / config.exp_name
     checkpoints_dir = run_dir / "checkpoints"
+    figures_dir = run_dir / "figures"
     checkpoints_dir.mkdir(parents=True, exist_ok=True)
+    figures_dir.mkdir(parents=True, exist_ok=True)
 
     logger = configure_logger(run_dir=run_dir)
     device = make_device(config)
@@ -229,8 +236,13 @@ def train(config: TrainConfig) -> None:
     history_rows: List[Dict[str, float]] = []
     history_path = run_dir / "history.csv"
     best_model_path = run_dir / "best_model.pth"
+    best_metrics_path = run_dir / "best_metrics.json"
+    training_curves_path = figures_dir / "training_curves.png"
+    best_cm_path = figures_dir / "best_confusion_matrix.png"
+    best_roc_path = figures_dir / "best_roc_curve.png"
 
     best_score = -float("inf")
+    best_epoch = 0
     no_improve_count = 0
     started_at = time.time()
 
@@ -288,6 +300,7 @@ def train(config: TrainConfig) -> None:
         }
         history_rows.append(epoch_row)
         write_history_csv(history_path, history_rows)
+        save_training_curves(history_rows, training_curves_path)
         _log_table_row(logger, epoch=epoch_num, train_metrics=train_metrics, val_metrics=val_metrics, learning_rate=current_lr)
 
         checkpoint_payload = {
@@ -300,14 +313,48 @@ def train(config: TrainConfig) -> None:
             "val_metrics": val_metrics,
         }
         torch.save(checkpoint_payload, checkpoints_dir / "last_checkpoint.pth")
+        logger.info("Saved: %s", (checkpoints_dir / "last_checkpoint.pth").as_posix())
         if config.save_model > 0 and epoch_num % config.save_model == 0:
             torch.save(checkpoint_payload, checkpoints_dir / f"checkpoint_epoch_{epoch_num:03d}.pth")
+            logger.info("Saved: %s", (checkpoints_dir / f"checkpoint_epoch_{epoch_num:03d}.pth").as_posix())
 
         current_score = val_metrics["auc"] if not np.isnan(val_metrics["auc"]) else -val_metrics["loss"]
         if current_score > best_score:
             best_score = current_score
+            best_epoch = epoch_num
             no_improve_count = 0
             torch.save(checkpoint_payload, best_model_path)
+            logger.info("Saved: %s", best_model_path.as_posix())
+
+            best_metrics = {
+                "epoch": epoch_num,
+                "score": float(current_score),
+                "train_metrics": train_metrics,
+                "val_metrics": val_metrics,
+            }
+            with open(best_metrics_path, "w", encoding="utf-8") as file:
+                json.dump(best_metrics, file, indent=2, ensure_ascii=False)
+
+            cm = np.array(
+                [
+                    [int(val_metrics["tn"]), int(val_metrics["fp"])],
+                    [int(val_metrics["fn"]), int(val_metrics["tp"])],
+                ],
+                dtype=np.int32,
+            )
+            save_confusion_matrix(cm, best_cm_path, title=f"Best Confusion Matrix (Epoch {epoch_num})")
+            roc_saved = save_roc_curve(
+                y_true=val_y_true,
+                y_prob=val_y_prob,
+                out_path=best_roc_path,
+                title=f"Best ROC Curve (Epoch {epoch_num})",
+            )
+            if roc_saved:
+                logger.info("Saved: %s", best_roc_path.as_posix())
+            else:
+                logger.info("Skipped ROC curve (validation labels have only one class).")
+            logger.info("Saved: %s", best_cm_path.as_posix())
+            logger.info("Saved: %s", best_metrics_path.as_posix())
             logger.info("Best model updated at epoch %d (score=%.4f).", epoch_num, best_score)
         else:
             no_improve_count += 1
@@ -317,9 +364,10 @@ def train(config: TrainConfig) -> None:
             break
 
     logger.info(
-        "Training finished in %.1f min | best score=%.4f | artifacts=%s",
+        "Training finished in %.1f min | best score=%.4f | best epoch=%d | artifacts=%s",
         (time.time() - started_at) / 60.0,
         best_score,
+        best_epoch,
         run_dir.resolve(),
     )
 
