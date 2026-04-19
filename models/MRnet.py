@@ -1,10 +1,16 @@
 import torch
 import torch.nn as nn
 from torchvision import models
-import os
+
+
+def _build_efficientnet_b0():
+    try:
+        return models.efficientnet_b0(weights=models.EfficientNet_B0_Weights.DEFAULT)
+    except Exception:
+        return models.efficientnet_b0(pretrained=True)
 
 class MRnet(nn.Module):
-    """MRnet uses pretrained resnet50 as a backbone to extract features
+    """MRnet uses pretrained EfficientNet-B0 as a backbone to extract features
     """
     
     def __init__(self):
@@ -14,12 +20,17 @@ class MRnet(nn.Module):
         super(MRnet,self).__init__()
 
         # Initialize three backbones for three axis
-        # All the three axes will use pretrained AlexNet model
+        # All the three axes will use pretrained EfficientNet-B0 model
         # The models will be used for extracting features from
         # the input images
-        self.axial = models.alexnet(pretrained=True).features
-        self.coronal = models.alexnet(pretrained=True).features
-        self.saggital = models.alexnet(pretrained=True).features
+        self.axial = _build_efficientnet_b0().features
+        self.coronal = _build_efficientnet_b0().features
+        self.saggital = _build_efficientnet_b0().features
+
+        # Old AlexNet backbone (kept for reference):
+        # self.axial = models.alexnet(pretrained=True).features
+        # self.coronal = models.alexnet(pretrained=True).features
+        # self.saggital = models.alexnet(pretrained=True).features
         
         # Initialize 2D Adaptive Average Pooling layers
         # The pooling layers will reduce the size of
@@ -33,7 +44,7 @@ class MRnet(nn.Module):
         # The network will output the probability of
         # having a particular disease
         self.fc = nn.Sequential(
-            nn.Linear(in_features=3*256,out_features=1)
+            nn.Linear(in_features=3*1280, out_features=1)
         )
 
     def forward(self,x):
@@ -47,19 +58,19 @@ class MRnet(nn.Module):
         images = [torch.squeeze(img, dim=0) for img in x]
         
         # Extract features across each of the three plane
-        # using the three pre-trained AlexNet models defined earlier
+        # using the three pre-trained EfficientNet-B0 models defined earlier
         image1 = self.axial(images[0])
         image2 = self.coronal(images[1])
         image3 = self.saggital(images[2])
 
-        # Convert the image dimesnsions from [slices, 256, 1, 1] to
-        # [slices,256]
+        # Convert the image dimensions from [slices, 1280, 1, 1] to
+        # [slices,1280]
         image1 = self.pool_axial(image1).view(image1.size(0), -1)
         image2 = self.pool_coronal(image2).view(image2.size(0), -1)
         image3 = self.pool_saggital(image3).view(image3.size(0), -1)
 
         # Find maximum value in each slice
-        # This will reduce the dimensions of image to [1,256]
+        # This will reduce the dimensions of image to [1,1280]
         # This is done in order to keep only the most prevalent
         # features for each slice
         image1 = torch.max(image1,dim=0,keepdim=True)[0]
@@ -67,7 +78,7 @@ class MRnet(nn.Module):
         image3 = torch.max(image3,dim=0,keepdim=True)[0]
 
         # Stack the 3 images together to create the output
-        # of size [1, 256*3]
+        # of size [1, 1280*3]
         output = torch.cat([image1,image2,image3], dim=1)
 
         # Feed the output to the sequential network created earlier
